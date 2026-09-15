@@ -1,0 +1,46 @@
+sector_orig,industry,industry_group
+Building,Construction & Building,Industrials
+Construction,Construction & Building,Industrials
+Electrical Equipment,Electrical Equipment,Industrials
+Machinery,Machinery & Equipment,Industrials
+Industrial Conglomerates,Industrial Conglomerates,Industrials
+Aerospace & Defense,Aerospace & Defense,Industrials
+Logistics & Transportation,Logistics & Transportation,Industrials
+Road & Rail,Logistics & Transportation,Industrials
+Marine,Logistics & Transportation,Industrials
+Airlines,Logistics & Transportation,Industrials
+Retail,Retail,Consumer Discretionary
+"Hotels, Restaurants & Leisure",Hospitality,Consumer Discretionary
+Diversified Consumer Services,Consumer Services,Consumer Discretionary
+"Textiles, Apparel & Luxury Goods",Luxury & Apparel,Consumer Discretionary
+Consumer products,Consumer Goods,Consumer Discretionary
+Automobiles,Automotive,Consumer Discretionary
+Consumer Discretionary,Consumer Discretionary,Consumer Discretionary
+Banking,Banking,Financials
+Insurance,Insurance,Financials
+Financial Services,Financial Services,Financials
+Financials,Financials,Financials
+Pharmaceuticals,Pharmaceuticals,Health Care
+Biotechnology,Biotechnology,Health Care
+Life Sciences Tools & Services,Life Sciences,Health Care
+Health Care,Health Care,Health Care
+Technology,Technology,Information Technology
+Semiconductors,Semiconductors,Information Technology
+IT,Information Technology,Information Technology
+Media,Media & Entertainment,Communication Services
+Telecommunication,Telecommunications,Communication Services
+Communications,Telecommunications,Communication Services
+Energy,Energy,Energy
+Utilities,Utilities,Utilities
+Chemicals,Chemicals,Materials
+Materials,Materials,Materials
+Metals & Mining,Metals & Mining,Materials
+Packaging,Packaging,Materials
+Real Estate,Real Estate,Real Estate
+Professional Services,Professional Services,Consumer Discretionary
+Commercial Services & Supplies,Professional Services,Industrials
+Beverages,Beverages,Consumer Staples
+Food Products,Food Products,Consumer Staples
+Consumer Staples,Consumer Staples,Consumer Staples
+Trading Companies & Distributors,Distribution,Industrials
+Distributors,Distribution,Industrials
