@@ -1,4 +1,4 @@
-# portfolio
+# R-based portfolio analysis toolkit
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![R](https://img.shields.io/badge/R-4.x-276DC3?logo=r)
