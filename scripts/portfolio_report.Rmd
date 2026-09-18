@@ -598,6 +598,7 @@ heatmap_plot <- ggplot(cor_melted, aes(ticker1, ticker2, fill = correlation)) +
     )
   )
 
+dir.create(here::here("outputs"), showWarnings = FALSE, recursive = TRUE)
 ggsave(
   here::here("outputs", paste0("correlation_matrix_", params$portfolio, ".png")),
   heatmap_plot, width = 12, height = 11, dpi = 300

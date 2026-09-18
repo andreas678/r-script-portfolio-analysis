@@ -123,3 +123,34 @@ read_holdings_table_by_isin <- function(path, weight_col = "Gewichtung") {
 
   stop("Fehler: Kein Tabellenblatt mit einer 'ISIN'/'", weight_col, "'-Kopfzeile gefunden! Bitte Rohdatei pruefen.")
 }
+
+# tickerliste.xlsx's last_updated column has accumulated mixed
+# representations across past runs (raw Excel serial-date numbers stored as
+# text, ISO date strings, genuine Date/numeric values from read_excel), which
+# makes read_excel() guess `character` for the whole column. That silently
+# breaks any later bind_rows() against a real Date column (e.g. new rows
+# stamped with last_updated = Sys.Date()). Call this right after reading
+# tickerliste to normalize it back to a clean Date vector before use.
+normalize_last_updated <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXct")) return(as.Date(x))
+
+  x_chr <- as.character(x)
+  # ISO date, optionally with a trailing " HH:MM:SS" time-of-day - readxl
+  # sometimes renders a genuine Date-typed cell back as this full timestamp
+  # text on re-read, rather than as a native Date/POSIXct value.
+  is_iso    <- !is.na(x_chr) & grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2}", x_chr)
+  is_serial <- !is.na(x_chr) & !is_iso & grepl("^[0-9]+(\\.[0-9]+)?$", x_chr)
+
+  out <- as.Date(rep(NA_real_, length(x_chr)))
+  out[is_iso]    <- as.Date(substr(x_chr[is_iso], 1, 10))
+  out[is_serial] <- as.Date(as.numeric(x_chr[is_serial]), origin = "1899-12-30")
+
+  unparsed <- !is.na(x_chr) & !is_serial & !is_iso
+  if (any(unparsed)) {
+    warning(sum(unparsed), " last_updated value(s) could not be parsed and were set to NA: ",
+            paste(unique(x_chr[unparsed]), collapse = ", "), call. = FALSE)
+  }
+
+  out
+}

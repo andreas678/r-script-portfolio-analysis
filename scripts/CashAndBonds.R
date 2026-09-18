@@ -14,6 +14,7 @@ library(writexl)
 library(here)
 
 source(here::here("scripts", "utils", "sector_taxonomy.R"))
+source(here::here("scripts", "utils", "data_loaders.R"))
 
 data_dir   <- here::here("data", "clean")
 ticker_path <- here::here("meta", "tickerliste.xlsx")
@@ -61,7 +62,9 @@ cash_bonds_allocations %>%
 # read — coercing every column to text on write-back would corrupt the
 # existing last_updated Date column (and any other typed columns) for all
 # ~4600 rows just to add these 2. Preserve native types instead.
-tickerliste <- read_excel(ticker_path) %>% as_tibble()
+tickerliste <- read_excel(ticker_path) %>%
+  as_tibble() %>%
+  mutate(last_updated = normalize_last_updated(last_updated))
 
 new_ticker_rows <- tribble(
   ~ticker,          ~alpha2, ~alpha3, ~countryname, ~companyname,     ~asset_class, ~sector,                        ~industry,

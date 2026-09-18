@@ -24,6 +24,7 @@ library(jsonlite)
 
 source(here::here("scripts", "utils", "sector_taxonomy.R"))
 source(here::here("scripts", "utils", "security.R"))
+source(here::here("scripts", "utils", "data_loaders.R"))
 
 # ============================================================================
 # CONFIG
@@ -38,7 +39,9 @@ backup_path <- here::here("meta", "tickerliste_backup.xlsx")
 # ============================================================================
 
 # Load current tickerliste
-tickerliste <- read_excel(ticker_path) %>% as_tibble()
+tickerliste <- read_excel(ticker_path) %>%
+  as_tibble() %>%
+  mutate(last_updated = normalize_last_updated(last_updated))
 
 cat("Initial state:\n")
 cat("  Rows:", nrow(tickerliste), "\n")
@@ -277,7 +280,9 @@ get_finnhub_sector <- function(ticker) {
 }
 
 # --- Identify US equities needing sector enrichment ---
-tickerliste <- read_excel(ticker_path) |> as_tibble()
+tickerliste <- read_excel(ticker_path) |>
+  as_tibble() |>
+  mutate(last_updated = normalize_last_updated(last_updated))
 
 # Add columns if not present; cast to character in all cases because readxl
 # reads all-NA columns as <logical>, which causes rows_update() to type-error.
@@ -425,7 +430,9 @@ gics_sector_map <- c(
 # join (keyed on GICS_SECTORS) doesn't recognize.
 stopifnot(all(gics_sector_map %in% c(GICS_SECTORS, PSEUDO_SECTORS)))
 
-tickerliste <- read_excel(ticker_path) |> as_tibble()
+tickerliste <- read_excel(ticker_path) |>
+  as_tibble() |>
+  mutate(last_updated = normalize_last_updated(last_updated))
 
 # Preserve the pre-harmonization label. On re-runs, only backfill sector_orig
 # where it's still empty, so an already-harmonized value never overwrites

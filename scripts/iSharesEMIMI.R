@@ -4,6 +4,7 @@ library(countrycode)
 library(writexl)
 
 source(here::here("scripts", "utils", "logging.R"))
+source(here::here("scripts", "utils", "data_loaders.R"))
 
 # API-Key
 api_key <- Sys.getenv("EODHD_API_KEY")
@@ -177,7 +178,9 @@ print(
 
 # Define paths
 ticker_path <- here::here("meta", "tickerliste.xlsx")
-tickerliste <- read_excel(ticker_path) %>% as_tibble()
+tickerliste <- read_excel(ticker_path) %>%
+  as_tibble() %>%
+  mutate(last_updated = normalize_last_updated(last_updated))
 
 # 1. Identify new tickers (those in iShares but not in tickerliste)
 new_entries <- iSharesEMIMI %>%
