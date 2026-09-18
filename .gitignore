@@ -17,6 +17,7 @@ outputs/
 meta/
 !meta/tickerliste.xlsx
 !meta/sectormapping.csv
+!meta/closing_prices.csv
 results/
 *.png
 .posit/assistant
