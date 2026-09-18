@@ -3,13 +3,7 @@ portfolio_a,Portfolio A,portfolio_a.xlsx,single_tickers_a.xlsx,,Individual Secur
 portfolio_a,Portfolio A,portfolio_a.xlsx,Cash_A.xlsx,,Cash
 portfolio_a,Portfolio A,portfolio_a.xlsx,LowRiskBonds_A.xlsx,,Low Risk Bonds
 portfolio_a,Portfolio A,portfolio_a.xlsx,AmundiCoreWorld.xlsx,0.40,Amundi Core World
-portfolio_a,Portfolio A,portfolio_a.xlsx,XtrackersWorldExUSA.xlsx,0.10,Xtrackers World exUSA
-portfolio_a,Portfolio A,portfolio_a.xlsx,iSharesEMIMI.xlsx,0.30,iShares EM IMI
-portfolio_b,Portfolio B,portfolio_b.xlsx,DekaEuroStoxx50.xlsx,0.20,Deka Euro Stoxx 50
-portfolio_b,Portfolio B,portfolio_b.xlsx,DekaWorldClimateChange.xlsx,0.20,Deka World Climate Change
-portfolio_b,Portfolio B,portfolio_b.xlsx,OekoWorldTop10.xlsx,0.20,Oeko World
+portfolio_a,Portfolio A,portfolio_a.xlsx,iSharesEMIMI.xlsx,0.40,iShares EM IMI
 portfolio_b,Portfolio B,portfolio_b.xlsx,single_tickers_b.xlsx,,Individual Securities
 portfolio_b,Portfolio B,portfolio_b.xlsx,Cash_B.xlsx,,Cash
-portfolio_b,Portfolio B,portfolio_b.xlsx,LowRiskBonds_B.xlsx,,Low Risk Bonds
-portfolio_b,Portfolio B,portfolio_b.xlsx,AmundiDisruptiveTech.xlsx,0.20,Amundi Disruptive Tech
-portfolio_b,Portfolio B,portfolio_b.xlsx,CTLuxEuroSmComp.xlsx,0.05,CT Lux Euro Small Comp
+portfolio_b,Portfolio B,portfolio_b.xlsx,iSharesEMIMI.xlsx,0.60,iShares EM IMI
