@@ -1,0 +1,7 @@
+scenario,portfolio,exclude_tickers,exclude_index,exclude_alpha3,description
+complete,portfolio_a,,,,"Complete portfolio (all current holdings, no exclusions)"
+no_gold,portfolio_a,"GLD",,,"Portfolio without Gold (capital reallocated proportionally to the rest)"
+etf_stocks_only,portfolio_a,,"Cash,LowRiskBonds,Einzelaktien",,"ETFs only (excludes Einzelaktien, Cash, Low Risk Bonds)"
+holdings_only,portfolio_a,,"Cash,LowRiskBonds","GOLD,CRYPTO","All holdings (excludes Gold, Crypto, Cash, Low Risk Bonds)"
+ex_single-holdings,portfolio_a,,"Einzelaktien",,"All holdings except single stocks (excludes Einzelaktien)"
+complete,portfolio_b,,,,"Complete portfolio (all current holdings, no exclusions)"

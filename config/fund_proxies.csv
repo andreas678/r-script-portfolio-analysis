@@ -1,0 +1,2 @@
+fund_file,proxy_file,exclude_alpha3,note
+AmundiCoreWorld.xlsx,iSharesWorld.xlsx,,"Amundi Core MSCI World SWAP ETF (confirmed 'Synthetic' in its own export, 4 swap counterparties): its published holdings are the swap's collateral basket (tech-heavy, R2 0.35 vs the fund's own series), not the MSCI World exposure. Replaced by the holdings of the physically replicated iShares Core MSCI World UCITS ETF (IE00B4L5Y983, same index) from scripts/iSharesWorld.R, renormalized to 100. Delete this row to use the basket as published."

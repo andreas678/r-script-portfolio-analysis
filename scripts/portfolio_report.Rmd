@@ -1,0 +1,1948 @@
+---
+title: "Portfolio Risk & Allocation Analysis"
+date: "`r Sys.Date()`"
+params:
+  portfolio:
+    label: "Portfolio"
+    value: portfolio_a
+    input: select
+    choices: [portfolio_a, portfolio_b]
+  scenario:
+    label: "Scenario"
+    value: complete
+    input: select
+    choices: [complete, no_gold, etf_stocks_only, holdings_only, ex_single-holdings]
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+  pdf_document:
+    toc: true
+    toc_depth: 2
+  word_document:
+    toc: true
+---
+
+<!--
+Choosing a portfolio/scenario: in RStudio, use Knit ▾ -> "Knit with
+Parameters..." to pick "portfolio_a"/"portfolio_b" and a scenario from a dropdown
+before rendering. Plain "Knit" reuses whichever values were picked last
+(default: portfolio_a / complete). Scenarios are defined per-portfolio in
+config/scenarios.csv - picking a scenario not defined for the chosen
+portfolio (e.g. portfolio_b currently only has "complete") falls back to
+"complete" with a visible note in the rendered report.
+
+Note: both portfolios render to the same output filename
+(portfolio_report.html) next to this file, since the file choice is only
+known once the dialog is submitted. Rename/copy the output after knitting
+if you want to keep both portfolios' HTML side by side, or render
+headlessly with an explicit output_file, e.g.:
+  rmarkdown::render("scripts/portfolio_report.Rmd",
+                     params = list(portfolio = "portfolio_b"),
+                     output_file = "../results/portfolio_b_report.html")
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+library(tidyverse)
+library(dplyr)
+library(countrycode)
+library(readxl)
+library(writexl)
+library(here)
+library(kableExtra)
+library(plotly)
+
+# Set up paths relative to working directory
+data_dir    <- here::here("data", "clean")
+data_out    <- here::here("data", "output")
+# Output folders the report writes into; a fresh checkout has none of them and the
+# render used to fail only at the very end (data/output export).
+for (d in c(data_dir, data_out, here::here("outputs"))) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+ticker_path <- here::here("meta", "tickerliste.xlsx")
+
+# Load tickerliste for sector enrichment
+# Use col_types = "text" initially to preserve all data
+tickerliste <- read_excel(ticker_path, col_types = "text") |>
+  as_tibble()
+
+# Ticker -> sector/industry lookup, built once and reused by every
+# downstream left_join instead of re-filtering/re-selecting tickerliste
+# at each call site.
+ticker_sector_lookup <- tickerliste |>
+  select(ticker, sector, industry) |>
+  distinct()
+
+# Shared title/subtitle styling of the report's ggplots. Add chart-specific
+# theme() tweaks after it: `theme_report() + theme(legend.position = "bottom")`.
+theme_report <- function(subtitle_size = 11) {
+  theme(plot.title = element_text(size = 14, face = "bold", margin = margin(b = 5)),
+        plot.subtitle = element_text(size = subtitle_size, color = "#666666",
+                                     margin = margin(b = 10)))
+}
+
+# Left-joins `df` (must have a `ticker` column) to ticker_sector_lookup and,
+# by default, replaces an unmatched sector with "Unclassified" (and industry
+# with "Other/Unknown" when include_industry = TRUE) - the join+replace_na
+# idiom repeated near-verbatim across most of the report's sector-based
+# charts/tables. Pass fill = FALSE to keep sector as NA instead (needed
+# where a caller filters on is.na(sector) itself, e.g. sector coverage %).
+with_sector <- function(df, sector_lookup = ticker_sector_lookup, include_industry = FALSE,
+                         fill = TRUE, unclassified_label = "Unclassified") {
+  cols <- if (include_industry) c("ticker", "sector", "industry") else c("ticker", "sector")
+  df <- df %>% left_join(sector_lookup %>% select(all_of(cols)), by = "ticker")
+  if (fill) {
+    df <- df %>% mutate(sector = replace_na(as.character(sector), unclassified_label))
+    if (include_industry) {
+      df <- df %>% mutate(industry = replace_na(as.character(industry), "Other/Unknown"))
+    }
+  }
+  df
+}
+
+# Renders a plotly hierarchy chart (ids/labels/parents/values, as used by
+# the sunburst chart) in HTML output; falls back to a text note
+# in PDF/Word, where plotly widgets don't render (they'd otherwise hard-stop
+# the whole render with "Functions that produce HTML output found in
+# document targeting docx output" unless always_allow_html is set).
+render_plotly_hierarchy <- function(data, type, title, fallback_msg, textposition = NULL) {
+  if (!knitr::is_html_output()) {
+    cat(fallback_msg)
+    return(invisible(NULL))
+  }
+  args <- list(data = data, ids = ~id, labels = ~label, parents = ~parent,
+               values = ~weight, type = type, textfont = list(size = 11))
+  if (!is.null(textposition)) args$textposition <- textposition
+  do.call(plot_ly, args) %>%
+    layout(title = title, margin = list(t = 50, l = 0, r = 0, b = 0))
+}
+
+# Portfolio construction (fund files + config/portfolio_configs.csv -> complete
+# holdings) lives in scripts/utils/portfolio_build.R, shared with the price
+# refresh (scripts/get_price_data.R) so both always see the same portfolio.
+# Fund files are read with config/ticker_disambiguation.csv applied: it rewrites
+# suffix-less tickers that EODHD would resolve to the wrong company's US listing.
+source(here::here("scripts", "utils", "ticker_disambiguation.R"))
+source(here::here("scripts", "utils", "portfolio_build.R"))
+source(here::here("scripts", "price_cache.R"))  # load_ticker_currency()
+source(here::here("scripts", "portfolio_returns.R"))  # compute_currency_exposure()
+source(here::here("scripts", "utils", "multiagent_export.R"))  # build_multiagent_export()
+source(here::here("scripts", "utils", "sleeve_model.R"))  # build_sleeves() / compute_sleeve_model()
+source(here::here("scripts", "utils", "report_caveats.R"))  # report_caveats(): Section 1.3 and the export
+ticker_disambiguation_rules <- load_ticker_disambiguation()
+
+# The set of portfolio ids is also hardcoded in this file's YAML
+# `params: portfolio: choices:` (render_reports.R now reads the ids from the config).
+portfolio_configs <- load_portfolio_configs()
+
+if (!params$portfolio %in% names(portfolio_configs)) {
+  stop("Unknown params$portfolio = '", params$portfolio, "'. Must be one of: ",
+       paste(names(portfolio_configs), collapse = ", "))
+}
+cfg <- portfolio_configs[[params$portfolio]]
+
+# Complete portfolio (every fund, before scenario exclusions); fund_data also
+# carries each fund's share for the composition bullets.
+built <- build_complete_portfolio(cfg, data_dir, ticker_disambiguation_rules)
+fund_data <- built$fund_data
+portfolio <- built$portfolio
+
+# ── Scenario filtering (optional exclusions, proportional reallocation) ─────
+# config/scenarios.csv defines, per portfolio, named scenarios that exclude
+# holdings by exact ticker (exclude_tickers), by fund/index name
+# (exclude_index - e.g. "Cash", "LowRiskBonds", "Einzelaktien"), or by the
+# synthetic alpha3 code used for non-country pseudo-holdings (exclude_alpha3
+# - e.g. "GOLD", "CRYPTO"; see single_tickers.R). A row is excluded if it
+# matches ANY of the three criteria. Excluded weight is redistributed
+# proportionally across the remaining holdings so the portfolio's total
+# weight is unchanged by filtering (the "complete" scenario excludes
+# nothing, so its reallocation factor is always 1).
+scenarios_path <- here::here("config", "scenarios.csv")
+scenarios <- readr::read_csv(
+  scenarios_path,
+  col_types = readr::cols(.default = readr::col_character())
+) %>%
+  mutate(portfolio = trimws(portfolio), scenario = trimws(scenario))
+
+scenario_row <- scenarios %>%
+  filter(portfolio == params$portfolio, scenario == params$scenario)
+
+# NOTE: this chunk has include=FALSE, which discards ALL console output
+# (see the portfolio-sanity-checks chunk below) - so a fallback note is
+# NOT cat() here; scenario_fallback_used is surfaced from that visible
+# chunk instead.
+scenario_fallback_used <- nrow(scenario_row) == 0
+if (scenario_fallback_used) {
+  scenario_row <- scenarios %>%
+    filter(portfolio == params$portfolio, scenario == "complete")
+  if (nrow(scenario_row) == 0) {
+    stop("No 'complete' scenario defined for portfolio '", params$portfolio,
+         "' in config/scenarios.csv.")
+  }
+}
+scenario_row <- scenario_row %>% slice(1)
+scenario_active      <- scenario_row$scenario[1]
+scenario_description <- scenario_row$description[1]
+
+split_scenario_list <- function(x) {
+  if (is.na(x) || !nzchar(trimws(x))) character(0) else trimws(strsplit(x, ",")[[1]])
+}
+scenario_exclude_tickers <- split_scenario_list(scenario_row$exclude_tickers[1])
+scenario_exclude_index   <- split_scenario_list(scenario_row$exclude_index[1])
+scenario_exclude_alpha3  <- split_scenario_list(scenario_row$exclude_alpha3[1])
+
+portfolio_weight_pre_scenario <- sum(portfolio$weight, na.rm = TRUE)
+
+portfolio <- portfolio %>%
+  filter(
+    !(ticker %in% scenario_exclude_tickers),
+    !(index %in% scenario_exclude_index),
+    !(alpha3 %in% scenario_exclude_alpha3)
+  )
+
+if (nrow(portfolio) == 0) {
+  stop("Scenario '", scenario_active, "' excluded all holdings for portfolio '",
+       params$portfolio, "' - check config/scenarios.csv.")
+}
+
+portfolio_weight_post_scenario <- sum(portfolio$weight, na.rm = TRUE)
+scenario_reallocation_factor <- portfolio_weight_pre_scenario / portfolio_weight_post_scenario
+portfolio <- portfolio %>% mutate(weight = weight * scenario_reallocation_factor)
+
+# Save results
+write_xlsx(portfolio, file.path(data_dir, cfg$output_file))
+
+# The report's tickers carry exchange suffixes (ASML.AS, config/ticker_disambiguation.csv) that the
+# ticker list does not, so a ticker join alone loses their sector. Complete the lookup through the
+# ISIN (sector_lookup_by_isin()), keeping every sector the ticker list already has.
+ticker_sector_lookup <- extend_sector_lookup(ticker_sector_lookup, portfolio, tickerliste)
+```
+
+```{r portfolio-sanity-checks}
+# The weight-sum/duplicate checks live in their own chunk (not the setup
+# chunk above) so their notices are actually visible: setup has
+# include=FALSE, which discards ALL of a chunk's output - console included
+# under headless rmarkdown::render() - even for cat(). This chunk has no
+# include=FALSE, so cat() output lands in the rendered report itself,
+# matching the pattern already used by the tornado-chart-analysis chunk's
+# sector-coverage notice further down. Not a hard stop on the weight-sum
+# check: the weight > 0 / ticker / alpha3 filter in the setup chunk is known
+# to trim some weight (see Section 7's Data Quality discussion of
+# dq_total_weight), so some deviation from 100 is expected.
+if (scenario_fallback_used) {
+  cat("=== Note: scenario '", params$scenario, "' is not defined for portfolio '",
+      params$portfolio, "' in config/scenarios.csv - falling back to '",
+      scenario_active, "'. ===\n", sep = "")
+}
+
+portfolio_total_weight_check <- sum(portfolio$weight, na.rm = TRUE)
+if (portfolio_total_weight_check < 90 || portfolio_total_weight_check > 110) {
+  cat("=== Note: portfolio '", params$portfolio, "' total weight is ",
+      round(portfolio_total_weight_check, 1), " (expected roughly 100) - check fund ",
+      "allocations in portfolio_configs and whether the weight/ticker/alpha3 filter ",
+      "in the setup chunk is dropping more than expected. ===\n", sep = "")
+}
+
+exact_dupe_rows <- portfolio %>% count(index, ISIN, ticker, weight) %>% filter(n > 1)
+if (nrow(exact_dupe_rows) > 0) {
+  cat("=== Note: ", nrow(exact_dupe_rows), " exact duplicate row(s) (same ",
+      "index/ISIN/ticker/weight) in portfolio '", params$portfolio, "' - a fund file may be ",
+      "listed twice in portfolio_configs. ===\n", sep = "")
+}
+
+# Per-fund completeness check: a fund with a FIXED allocation weight (i.e.
+# not NA/self-weighted) is scaled on the assumption that its own `weight`
+# column sums to ~100 (representing the fund's full holdings) before being
+# multiplied by that allocation. A manually-maintained or partial holdings
+# file - e.g. a "top N holdings" snapshot rather than the complete fund -
+# that sums to much less silently under-represents its intended allocation
+# in the final portfolio, with no error or visible sign anywhere else.
+fund_completeness <- fund_data %>%
+  filter(!is.na(weight)) %>%
+  mutate(fund_own_weight_sum = purrr::map_dbl(raw, ~ sum(.x$weight, na.rm = TRUE))) %>%
+  filter(fund_own_weight_sum < 90 | fund_own_weight_sum > 110)
+
+if (nrow(fund_completeness) > 0) {
+  fund_completeness %>%
+    pwalk(function(file, weight, label, fund_own_weight_sum, ...) {
+      cat("=== Note: fund '", label, "' (", file, ") has its own holdings summing to ",
+          round(fund_own_weight_sum, 1), "% (expected ~100%) instead of representing the ",
+          "complete fund. Its intended ", round(weight * 100, 2), "% portfolio allocation ",
+          "will therefore actually contribute only about ", round(weight * fund_own_weight_sum, 2),
+          "% of total portfolio weight - check whether this is a partial/top-holdings file. ===\n",
+          sep = "")
+    })
+}
+```
+
+<!-- Calculations first: the Executive Summary quotes figures from Sections 2 and 6, so the
+     shared analysis (aggregates, prices, volatilities, the sleeve model) runs before it. -->
+
+```{r risk-metrics-calculation}
+# Calculate portfolio-level risk metrics and concentration analysis
+
+# Ticker-level and country-level aggregates, computed once here and reused
+# by the risk metrics below as well as the Holdings and Geographic sections
+# further down the report.
+ticker_summary <- portfolio %>%
+  filter(weight > 0, ticker != "-", !is.na(ticker), !is.na(alpha3)) %>%
+  group_by(ticker, alpha3) %>%
+  summarise(
+    weight = sum(weight, na.rm = TRUE),
+    name = first(name),
+    count = n(),
+    index = toString(sort(unique(index))),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(weight)) %>%
+  mutate(
+    weight_pct = weight,
+    country_code = countrycode(alpha3, "iso3c", "iso2c"),
+    asset_class = asset_class_of(alpha3, ticker)
+  )
+
+# Countries, sectors and position concentration are statements about EQUITIES. Gold and crypto have
+# no country (they used to show up as an "NA" country with a quarter of the weight), cash and bonds
+# carry DEU only because every row needs a country, and a gold position is not one of "N effective
+# holdings". So those measures use the equity part only; the other asset classes are reported as
+# asset classes (Section 1 / 2.1 / 2.5).
+equity_summary <- ticker_summary %>% filter(asset_class == "Equities")
+equity_weight_pct <- sum(equity_summary$weight) / sum(ticker_summary$weight) * 100
+
+# Country weights are % of the whole portfolio (so they add up to equity_weight_pct);
+# equity_share_pct re-expresses them within the equity part.
+country_summary <- portfolio %>%
+  filter(weight > 0, alpha3 != "-", !is.na(ticker), !is.na(alpha3),
+         asset_class_of(alpha3, ticker) == "Equities") %>%
+  group_by(alpha3) %>%
+  summarise(
+    weight = sum(weight, na.rm = TRUE),
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(weight)) %>%
+  mutate(
+    weight_pct = weight,
+    equity_share_pct = weight / sum(weight) * 100,
+    country_name = countrycode(alpha3, "iso3c", "country.name")
+  )
+
+# 1. Concentration of the equity part (unique ticker+country positions in ticker_summary, not raw
+# portfolio rows, which can repeat a ticker across multiple funds). Shares are within the equity
+# part (concentration_metrics()), so 'top 10 = 17%' means 17% of the equities.
+equity_concentration <- concentration_metrics(equity_summary$weight)
+herfindahl_index <- equity_concentration$hhi
+effective_num_holdings <- equity_concentration$enp
+top_1_weight  <- equity_concentration$top[["top1"]]
+top_5_weight  <- equity_concentration$top[["top5"]]
+top_10_weight <- equity_concentration$top[["top10"]]
+
+# 2. Country concentration (equity part)
+country_summary_sorted <- country_summary %>% arrange(desc(weight_pct))
+
+country_concentration <- sum(head(country_summary_sorted$equity_share_pct, 3))
+top_country <- country_summary_sorted$alpha3[1]
+top_country_name <- countrycode(top_country, "iso3c", "country.name")
+top_country_weight <- country_summary_sorted$weight_pct[1]               # % of the whole portfolio
+top_country_equity_share <- country_summary_sorted$equity_share_pct[1]   # % of the equity part
+top3_country_names <- paste(head(country_summary_sorted$country_name, 3), collapse = ", ")
+
+# 3. Sector coverage of the equity part: cash, bonds, gold and crypto have pseudo-sectors by
+# construction, which would count as 'classified' and inflate the figure.
+equity_rows <- portfolio %>% filter(asset_class_of(alpha3, ticker) == "Equities")
+sector_weight_classified <- equity_rows %>%
+  with_sector(fill = FALSE) %>%
+  filter(!is.na(sector)) %>%
+  pull(weight) %>%
+  sum()
+
+sector_coverage_pct <- round(sector_weight_classified / sum(equity_rows$weight) * 100, 1)
+
+# 4. Currency exposure by TRADING (listing) currency, from meta/ticker_currency.csv
+# (scripts/get_currency_map.R). This replaces the earlier country proxy
+# (European countries = EUR, USA = USD), which mislabelled CHF/SEK/DKK holdings
+# as EUR, US-listed ADRs of foreign companies as domestic, and could not see
+# HKD/TWD/KRW/JPY at all. Listing currency is still not economic exposure (a
+# multinational's revenues are in many currencies) - it is the currency the
+# position's price, and therefore its EUR return, is actually quoted in.
+# Holdings without a currency-map entry (mostly small non-US positions whose
+# fund export carries a bare local ticker EODHD can't resolve) fall back to the
+# currency of the holding's country (ISO 4217 via countrycode) - an
+# approximation, reported separately as currency_inferred_pct; anything still
+# unknown (pseudo-countries like GOLD/CRYPTO without a map entry) is "Unassigned".
+currency_result <- compute_currency_exposure(portfolio, load_ticker_currency())
+currency_by_holding <- currency_result$by_holding
+currency_exposure   <- currency_result$exposure
+
+currency_weight <- function(ccy) sum(currency_exposure$weight[currency_exposure$currency == ccy])
+eur_exposure <- currency_weight("EUR")
+usd_exposure <- currency_weight("USD")
+currency_unassigned_pct <- currency_weight("Unassigned") / sum(currency_exposure$weight) * 100
+currency_inferred_pct <- sum(currency_by_holding$weight[currency_by_holding$currency_basis == "country"]) /
+  sum(currency_by_holding$weight) * 100
+
+# What sits inside the USD share: US companies, USD-priced gold/crypto, and
+# non-US companies with a US listing (ADRs - or a bare ticker that matches an
+# unrelated US symbol, which the currency map cannot tell apart).
+usd_rows <- currency_by_holding %>% filter(currency == "USD")
+usd_breakdown_pct <- c(
+  us     = sum(usd_rows$weight[usd_rows$alpha3 == "USA"]),
+  pseudo = sum(usd_rows$weight[usd_rows$alpha3 %in% c("GOLD", "CRYPTO")]),
+  other  = sum(usd_rows$weight[!usd_rows$alpha3 %in% c("USA", "GOLD", "CRYPTO")])
+) / sum(currency_by_holding$weight) * 100
+```
+
+```{r tornado-chart-analysis, message=FALSE, warning=FALSE}
+# Inline tornado chart analysis without relying on sourced script
+# This ensures all objects are created in knit environment
+
+library(httr)
+library(jsonlite)
+api_key <- Sys.getenv("EODHD_API_KEY")
+
+# Load volatility functions
+source(here::here("scripts", "get_volatility_data.R"))
+source(here::here("scripts", "utils", "sector_taxonomy.R"))
+
+# Load the closing-price history once via the shared cache reader
+# (price_cache.R); reused here for volatility and again in the
+# correlation-analysis-prices chunk below. Converted to EUR: the cache holds
+# each listing's local currency, and every return, volatility and correlation
+# below is meant from a EUR investor's view (FX moves included). Rows that
+# can't be converted (no currency / FX rate) are dropped, with a warning.
+closing_prices_clean <- load_cached_prices_eur()
+# Kept for Section 8 (Data Quality): the attribute doesn't survive further
+# dplyr steps, and this chunk's warning (include=FALSE) is never shown.
+price_conversion_dropped <- attr(closing_prices_clean, "dropped")
+if (is.null(price_conversion_dropped)) {
+  price_conversion_dropped <- tibble(ticker = character(), Date = as.Date(character()),
+                                     currency = character())
+}
+
+# Volatility estimates by sector: SECTOR_VOL_ESTIMATES (sector_taxonomy.R) is a
+# NAMED vector covering the 11 GICS sectors, Digital Assets, Commodities and
+# "Unclassified" (holdings with no sector), so the join key can't drift from the
+# labels tickerliste_maintenance.R harmonizes onto.
+volatility_estimates <- tibble(
+  sector = names(SECTOR_VOL_ESTIMATES),
+  estimated_vol = unname(SECTOR_VOL_ESTIMATES)
+)
+
+# Assumed return / volatility for assets with no price history (cash, low-risk bonds):
+# config/sleeve_assumptions.csv, shared with the sleeve model in 2.1. The volatility is checked
+# before historical/sector estimates in the coalesce chain below, so these don't fall through to
+# the sector-estimate default (22%), which would be wrong for them.
+sleeve_assumptions <- load_sleeve_assumptions()
+manual_volatility_overrides <- sleeve_assumptions %>% transmute(ticker, manual_vol = volatility_pct)
+
+# Get top 20 tickers by weight and historical volatility. Cash/bonds are
+# always included regardless of rank, since they're structurally important
+# risk-defining line items even when they're not top holdings by weight.
+priority_tickers <- manual_volatility_overrides$ticker
+
+top_20_tickers <- ticker_summary %>%
+  arrange(desc(weight_pct)) %>%
+  filter(ticker %in% priority_tickers | row_number() <= 20) %>%
+  pull(ticker)
+historical_vol <- batch_calculate_volatility(top_20_tickers, prices_df = closing_prices_clean)
+
+# CAPM-style market beta vs. MSCI World (URTH) — a genuine cov/var beta,
+# distinct from the relative_volatility ratio computed further down. NA for
+# holdings without enough cached price history (cash, low-risk bonds, etc.).
+market_beta_tbl <- batch_calculate_market_beta(top_20_tickers, prices_df = closing_prices_clean,
+                                               benchmark = "URTH")
+
+# Build risk contribution analysis
+portfolio_risk <- ticker_summary %>%
+  filter(ticker %in% top_20_tickers) %>%
+  arrange(desc(weight_pct)) %>%
+  with_sector() %>%
+  left_join(historical_vol %>% select(ticker, volatility_pct), by = "ticker") %>%
+  left_join(market_beta_tbl %>% select(ticker, market_beta, market_beta_sync = beta_sync,
+                                       market_beta_r2 = r_squared), by = "ticker") %>%
+  left_join(volatility_estimates, by = "sector") %>%
+  left_join(manual_volatility_overrides, by = "ticker") %>%
+  mutate(
+    volatility = coalesce(manual_vol, volatility_pct, estimated_vol, 22),
+    vol_source = case_when(
+      !is.na(manual_vol) ~ "Manual",
+      !is.na(volatility_pct) ~ "Historical",
+      !is.na(estimated_vol) ~ "Estimated",
+      TRUE ~ "Default"
+    )
+  ) %>%
+  select(ticker, name, weight_pct, sector, index, volatility, vol_source,
+         market_beta, market_beta_sync, market_beta_r2)
+
+# vol_source == "Default" means sector didn't match any row in
+# volatility_estimates (SECTOR_VOL_ESTIMATES) - i.e. an
+# unharmonized/unmapped sector label silently fell through to the 22%
+# default instead of a real historical or sector-based estimate.
+unmapped_sector_rows <- portfolio_risk %>% filter(vol_source == "Default")
+if (nrow(unmapped_sector_rows) > 0) {
+  cat("\n=== Warning:", nrow(unmapped_sector_rows), "holding(s) totalling",
+      round(sum(unmapped_sector_rows$weight_pct), 2),
+      "% weight have an unrecognized sector label and fell through to the",
+      "22% default volatility:", paste(unique(unmapped_sector_rows$sector), collapse = ", "),
+      "===\n\n")
+}
+
+portfolio_weight_total <- sum(portfolio_risk$weight_pct)
+portfolio_weighted_vol <- sum(portfolio_risk$weight_pct * portfolio_risk$volatility) / portfolio_weight_total
+
+risk_contribution <- portfolio_risk %>%
+  mutate(
+    risk_contribution = weight_pct * (volatility / 100),
+    risk_contribution_pct = (risk_contribution / sum(risk_contribution)) * 100,
+    # Standalone volatility as a multiple of the portfolio's weighted-average
+    # volatility. NOT a beta: it carries no correlation term and does not use
+    # true portfolio vol as the denominator (a portfolio beta would be
+    # rho_ip * sigma_i / sigma_p). See market_beta for the cov/var beta.
+    relative_volatility = (volatility / portfolio_weighted_vol),
+    label = paste0(ticker, " - ", str_trunc(name, 25, side = "right")),
+    mean_contribution = mean(risk_contribution),
+    deviation = risk_contribution - mean_contribution,
+    direction = if_else(deviation > 0, "Above Average", "Below Average")
+  ) %>%
+  arrange(desc(risk_contribution_pct))
+
+tornado_data <- risk_contribution %>% filter(abs(deviation) > 0.01) %>% arrange(risk_contribution)
+
+# The /data/output export for multi-agent (see CLAUDE.md) happens later, in
+# multiagent-export below Section 6.3 - it merges this top-20-by-weight view with the
+# full-universe risk/return positioning data, which isn't computed until Section 6.
+
+```
+
+```{r analysis-window, include=FALSE}
+# One return panel of the held tickers with a current price history, built once and shared by the
+# look-through risk table (2.3.1) and the performance sections (6.x). Its dates are the window the
+# whole report is measured on. Only tickers the price refresh maintains (summed weight in the
+# COMPLETE portfolio >= PRICE_REFRESH_MIN_WEIGHT_PCT): a held ticker below the cut-off is not
+# refreshed, its cached series starts and stops at some old date, and since the panel keeps only
+# the dates every ticker has, it would cut the window of the whole report to its own.
+maintained_tickers <- refresh_tickers(built$portfolio %>%
+  filter(weight > 0, ticker != "-", !is.na(ticker), !is.na(alpha3)))
+covered_panel <- build_return_panel(closing_prices_clean,
+                                    tickers = intersect(unique(ticker_summary$ticker), maintained_tickers),
+                                    min_observations = 100)
+covered_weight_pct <- sum(ticker_summary$weight[ticker_summary$ticker %in% names(covered_panel)]) /
+  sum(ticker_summary$weight) * 100
+
+sleeves <- build_sleeves(portfolio, fund_data, load_etf_listings())
+sleeve_model <- compute_sleeve_model(sleeves, closing_prices_clean, covered_panel$Date, sleeve_assumptions)
+
+sleeve_top <- sleeve_model$sleeves %>% slice_max(risk_share_pct, n = 1)
+sleeve_assumed <- sleeve_model$sleeves %>% filter(kind == "synthetic")
+
+# Asset-class split of the whole portfolio (% of weight); see asset_class_of().
+asset_class_pct <- portfolio %>%
+  mutate(asset_class = asset_class_of(alpha3, ticker)) %>%
+  group_by(asset_class) %>%
+  summarise(weight = sum(weight), .groups = "drop") %>%
+  mutate(weight = weight / sum(weight) * 100) %>%
+  arrange(desc(weight))
+non_equity_pct <- 100 - sum(asset_class_pct$weight[asset_class_pct$asset_class == "Equities"])
+
+# "Data as of": the newest price in the cache, not the render date (a render on a weekend or after a
+# stale fetch would otherwise claim fresher data than it holds).
+data_as_of <- max(closing_prices_clean$Date)
+window_months <- as.numeric(diff(sleeve_model$window)) / 30.44
+```
+
+## 1. Executive Summary
+
+**`r cfg$display_name`**: `r n_distinct(portfolio$index)` building blocks (funds, single securities, gold, crypto, cash and bonds), `r nrow(ticker_summary)` distinct look-through positions. **Data as of `r format(data_as_of, "%d %B %Y")`** (newest price in the cache; rendered `r format(Sys.Date(), "%d %B %Y")`). Risk and return are measured over `r format(sleeve_model$window[1], "%d %b %Y")` to `r format(sleeve_model$window[2], "%d %b %Y")` (`r round(window_months, 1)` months, `r sleeve_model$n_steps` steps), in EUR; the window ends on the last date for which every price series has a quote.
+
+`r if (scenario_active != "complete") paste0("> **Scenario: ", scenario_active, "** - ", scenario_description, " Excluded weight was reallocated proportionally across the remaining holdings (factor ", round(scenario_reallocation_factor, 3), ").")`
+
+### 1.1 Key Figures
+
+```{r key-figures, echo=FALSE}
+asset_mix <- paste0(asset_class_pct$asset_class, " ", round(asset_class_pct$weight, 1), "%", collapse = " | ")
+# Largest FUND = largest fixed allocation; the self-weighted files (single securities, cash, bonds) are buckets, not funds.
+top_fund <- fund_data %>% filter(!is.na(weight)) %>% slice_max(pct, n = 1, with_ties = FALSE)
+
+tibble(
+  Measure = c("Asset classes (weight)", "Return over the window", "Volatility (annualized)",
+              "Maximum drawdown", "Largest risk driver", "Diversification ratio",
+              "Currency (trading currency)", "Concentration (equity part)", "Coverage"),
+  Value = c(
+    asset_mix,
+    sprintf("%+.1f%% (%.1f months)", sleeve_model$cumulative_return_pct, window_months),
+    paste0(round(sleeve_model$volatility_pct, 1), "%"),
+    paste0(round(sleeve_model$max_drawdown_pct, 1), "%"),
+    paste0(sleeve_top$label, ": ", round(sleeve_top$risk_share_pct, 1), "% of risk on ",
+           round(sleeve_top$weight, 1), "% of weight"),
+    paste0(round(sleeve_model$diversification_ratio, 2), "x"),
+    paste0("EUR ", round(eur_exposure, 1), "% | USD ", round(usd_exposure, 1), "%"),
+    paste0(round(equity_concentration$enp), " effective positions | top 10 = ", round(top_10_weight, 1),
+           "% of the equities | largest fund ", top_fund$label, " ", round(top_fund$pct * 100, 1), "%"),
+    paste0("Whole-portfolio model ", round(sleeve_model$coverage_pct, 1), "% of weight | look-through price history ",
+           round(covered_weight_pct, 1), "%")
+  ),
+  Section = c("2.1", "2.1, 6.1", "2.1", "2.1", "2.1", "2.1", "2.5", "2.5, 4", "7")
+) %>%
+  knitr::kable(caption = "Key figures (whole-portfolio model, Section 2.1)") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+### 1.2 What Stands Out
+
+```{r what-stands-out, results='asis', echo=FALSE}
+risk_ratio <- sleeve_top$risk_share_pct / sleeve_top$weight
+cat("- **Largest risk contributor: ", sleeve_top$label, ".** It carries ", round(sleeve_top$risk_share_pct, 1),
+    "% of the portfolio's volatility on ", round(sleeve_top$weight, 1), "% of its weight (",
+    round(risk_ratio, 2), "x its weight share).\n", sep = "")
+non_equity <- asset_class_pct %>% filter(asset_class != "Equities")
+if (nrow(non_equity) > 0) {
+  cat("- **", round(non_equity_pct, 1), "% of the weight is outside equities** (",
+      paste0(non_equity$asset_class, " ", round(non_equity$weight, 1), "%", collapse = ", "),
+      "), so equity indices are only a partial yardstick (Section 6.1).\n", sep = "")
+}
+cat("- **", top_country_name, " is the largest equity market at ", round(top_country_equity_share, 1),
+    "% of the equities** (", round(top_country_weight, 1), "% of the portfolio); ", round(usd_exposure, 1), "% of the portfolio is priced in USD",
+    if (usd_breakdown_pct[["pseudo"]] > 0.05) paste0(", of which ", round(usd_breakdown_pct[["pseudo"]], 1),
+                                                     " points are gold and crypto") else "", ".\n", sep = "")
+cat("- **Diversification across building blocks**: their volatilities add up to ",
+    round(sleeve_model$diversification_ratio, 2), "x the portfolio's own volatility (1.0x = no diversification).\n", sep = "")
+```
+
+### 1.3 Read With Care
+
+```{r read-with-care, results='asis', echo=FALSE}
+report_caveat_lines <- report_caveats(
+  window_months = window_months, n_steps = sleeve_model$n_steps, assumed = sleeve_assumed,
+  lookthrough_coverage_pct = covered_weight_pct,
+  unmodelled_labels = sleeve_model$unmodelled$label,
+  proxied_labels = if ("proxy_file" %in% names(fund_data)) fund_data$label[!is.na(fund_data$proxy_file)] else character(0),
+  unclassified_equity_pct = 100 - sector_coverage_pct
+)
+cat(report_caveat_lines, sep = "\n")
+cat("\n")
+```
+
+### 1.4 Portfolio Composition
+
+The portfolio consists of the following fund allocations:
+
+```{r composition-bullets, results='asis'}
+fund_data %>%
+  pwalk(function(label, pct, ...) {
+    cat("- **", label, "**: ", scales::percent(pct, accuracy = 0.01), "\n", sep = "")
+  })
+```
+
+------------------------------------------------------------------------
+
+## 2. Risk Profile & Concentration Analysis
+
+
+
+### 2.1 Portfolio Risk — Full Coverage
+
+This subsection describes the **whole portfolio**: every fund through its own price series (which already contains all of its holdings, costs and sampling), gold, crypto and single stocks through theirs, and Cash and Low Risk Bonds through an assumed return and volatility (`config/sleeve_assumptions.csv`; they have no price history). Volatility is the sample covariance of these building blocks over the window below, annualized by their observation frequency; the risk shares are the Euler decomposition and add up to the portfolio's volatility. The look-through subsections that follow rebuild risk from single holdings and serve as exposure detail.
+
+```{r sleeve-model, echo=FALSE, fig.height=5}
+tibble(
+  Measure = c("Window", "Weight modelled", "Volatility (annualized)", "Return over the window",
+              "Annualized return (mean log return)", "Maximum drawdown", "Diversification ratio",
+              "Largest risk contributor"),
+  Value = c(
+    paste0(format(sleeve_model$window[1]), " to ", format(sleeve_model$window[2]), " (",
+           sleeve_model$n_steps, " steps)"),
+    paste0(round(sleeve_model$coverage_pct, 1), "%"),
+    paste0(round(sleeve_model$volatility_pct, 1), "%"),
+    sprintf("%+.1f%%", sleeve_model$cumulative_return_pct),
+    sprintf("%+.1f%%", sleeve_model$annual_return_pct),
+    paste0(round(sleeve_model$max_drawdown_pct, 1), "%"),
+    paste0(round(sleeve_model$diversification_ratio, 2), "x"),
+    paste0(sleeve_top$label, ": ", round(sleeve_top$risk_share_pct, 1), "% of risk on ",
+           round(sleeve_top$weight, 1), "% of weight")
+  )
+) %>%
+  knitr::kable(caption = "Whole-portfolio risk and return (sleeve model)") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+sleeve_model$sleeves %>%
+  transmute(
+    Sleeve = label,
+    Basis = c(fund = "fund's own series", direct = "own series", synthetic = "assumed")[kind],
+    `Weight (%)` = round(weight, 1), `Vol (% p.a.)` = round(volatility_pct, 1),
+    `Return (% p.a.)` = round(annual_return_pct, 1), `Risk share (%)` = round(risk_share_pct, 1),
+    `Risk / weight (x)` = round(risk_vs_weight, 2),
+    `Contribution to return (pp)` = round(return_contribution_pct, 1)
+  ) %>%
+  arrange(desc(`Risk share (%)`)) %>%
+  knitr::kable(caption = paste0("Risk and return by building block (Euler decomposition; risk shares add up to 100%; ",
+                                "contributions add up to the return over the window)")) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+sleeve_model$sleeves %>%
+  ggplot(aes(x = reorder(label, risk_share_pct), y = risk_share_pct)) +
+  geom_col(aes(fill = kind), width = 0.7) +
+  geom_point(aes(y = weight, shape = "Weight share"), size = 2.5, colour = "#222222") +
+  scale_fill_manual(values = c(fund = "#457B9D", direct = "#E9A036", synthetic = "#8D99AE"),
+                    labels = c(fund = "Fund's own series", direct = "Own series", synthetic = "Assumed"),
+                    name = NULL) +
+  scale_shape_manual(values = c("Weight share" = 18), name = NULL) +
+  coord_flip() +
+  labs(title = "Where the portfolio's risk comes from",
+       subtitle = "Bars: share of portfolio volatility. Diamonds: share of weight. Bar right of its diamond = more risk than weight.",
+       x = NULL, y = "% of portfolio") +
+  theme_minimal() +
+  theme_report(subtitle_size = 9) +
+  theme(legend.position = "bottom", panel.grid.major.y = element_blank())
+```
+
+The model covers **`r round(sleeve_model$coverage_pct, 1)`%** of the portfolio's weight`r if (nrow(sleeve_model$unmodelled) > 0) paste0(" (not modelled, no price series: ", paste(sleeve_model$unmodelled$label, collapse = ", "), ")") else ""`. The largest contributor is **`r sleeve_top$label`** with `r round(sleeve_top$risk_share_pct, 1)`% of the risk on `r round(sleeve_top$weight, 1)`% of the weight. The assumed building blocks (`r paste(sleeve_assumed$label, collapse = " and ")`) are `r round(sum(sleeve_assumed$weight), 1)`% of the weight and `r round(sum(sleeve_assumed$risk_share_pct), 1)`% of the risk, so the headline numbers hardly depend on those assumptions. The look-through rebuild further down can only see `r round(covered_weight_pct, 1)`% of the weight (Cash, bonds and the long tail of the funds have no price series) and renormalizes that part to 100%, which more than doubles the weight of the single holdings in it; use it for detail on single holdings, not for the portfolio's total risk.
+
+### 2.2 Historical Return Correlation
+
+```{r correlation-analysis-prices, echo=FALSE}
+# closing_prices_clean was loaded and cleaned in the tornado-chart-analysis
+# chunk above, where it's also used for historical volatility.
+
+# ── 1. Keep only tickers present in both datasets ───────────────────────────
+common_tickers <- intersect(unique(risk_contribution$ticker), unique(closing_prices_clean$ticker))
+
+# ── 2. Aligned daily log returns (current tickers with >= 100 observations) ───
+# Correlation is computed on log returns rather than raw price levels: two
+# holdings that have simply trended upward together show spuriously high
+# correlation on price levels even when their day-to-day moves are largely
+# independent. Returns are stationary and are the standard basis for this.
+# build_return_panel() also drops series that stopped updating, which would
+# otherwise cut every other ticker's shared history to their end date.
+returns_wide <- build_return_panel(closing_prices_clean, tickers = common_tickers,
+                                   min_observations = 100)
+
+# ── 3. Compute correlation matrix ────────────────────────────────────────────
+correlation_matrix <- returns_wide |>
+  select(-Date) |>
+  cor(use = "pairwise.complete.obs")
+
+date_range   <- format(range(returns_wide$Date), "%b %Y")
+n_tickers    <- ncol(correlation_matrix)
+n_obs        <- nrow(returns_wide)
+
+# ── 4. Summary statistics ─────────────────────────────────────────────────────
+lower_tri <- correlation_matrix[lower.tri(correlation_matrix)]
+
+# ── 5. Tidy long form (for downstream use / export) ───────────────────────────
+cor_df <- correlation_matrix |>
+  as.data.frame() |>
+  rownames_to_column("ticker1") |>
+  pivot_longer(-ticker1, names_to = "ticker2", values_to = "correlation")
+
+write.csv(
+  cor_df,
+  here::here("data", "clean", paste0("correlation_matrix_", params$portfolio, ".csv")),
+  row.names = FALSE
+)
+
+# ── 6. Heatmap ────────────────────────────────────────────────────────────────
+cor_melted <- cor_df |>
+  mutate(
+    ticker1 = factor(ticker1, levels = colnames(correlation_matrix)),
+    ticker2 = factor(ticker2, levels = colnames(correlation_matrix))
+  )
+
+heatmap_plot <- ggplot(cor_melted, aes(ticker1, ticker2, fill = correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    midpoint = 0, low = "#1a9850", mid = "white", high = "#d73027",
+    limits = c(-1, 1), name = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y  = element_text(size = 9),
+    axis.title   = element_blank(),
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    aspect.ratio = 1,
+    legend.position = "right"
+  ) +
+  labs(
+    title = paste0(
+      "Return Correlation Matrix: ", n_tickers, " Portfolio Tickers\n(",
+      date_range[1], " – ", date_range[2], ")"
+    )
+  )
+
+dir.create(here::here("outputs"), showWarnings = FALSE, recursive = TRUE)
+ggsave(
+  here::here("outputs", paste0("correlation_matrix_", params$portfolio, ".png")),
+  heatmap_plot, width = 12, height = 11, dpi = 300
+)
+
+print(heatmap_plot)
+
+```
+
+Based on `r scales::comma(n_obs)` trading days of return history across `r n_tickers` tickers (`r date_range[1]`–`r date_range[2]`), the average pairwise return correlation is `r round(mean(lower_tri), 2)`, ranging from `r round(min(lower_tri), 2)` to `r round(max(lower_tri), 2)`. This average weights every ticker pair equally regardless of position size; Section 2.3 below weights correlation by how much each pair actually contributes to portfolio risk.
+
+### 2.3 Risk-Weighted Diversification
+
+A plain sum of `weight × standalone volatility` implicitly assumes every holding is perfectly correlated (ρ = 1) — it ignores the diversification benefit captured by the correlation matrix above. This section combines portfolio weights, standalone volatilities, and the return correlation matrix, restricted to the tickers with both a risk estimate and sufficient price history (`r n_tickers` of the top holdings; Cash and Low Risk Bonds have no price history and are not in the correlation matrix).
+
+```{r risk-weighted-diversification, echo=FALSE}
+# ── Align weights and volatilities to the correlation matrix's tickers ────────
+rwd_tickers <- colnames(correlation_matrix)
+rwd_idx     <- match(rwd_tickers, portfolio_risk$ticker)
+sigma       <- portfolio_risk$volatility[rwd_idx] / 100
+w_raw       <- portfolio_risk$weight_pct[rwd_idx]
+w           <- w_raw / sum(w_raw)  # renormalized: this subset isn't 100% of the portfolio
+
+# ── Diversified vs. undiversified (rho = 1) portfolio volatility ─────────────
+sigma_p      <- sqrt(as.numeric(t(w) %*% (correlation_matrix * (sigma %o% sigma)) %*% w))
+sigma_undiv  <- sum(w * sigma)
+diversification_ratio_true <- sigma_undiv / sigma_p
+
+# ── Risk-weighted average correlation ─────────────────────────────────────────
+# Pairwise weight w_i*w_j*sigma_i*sigma_j reflects how much each pair actually
+# contributes to portfolio variance, rather than counting every pair equally.
+rw_matrix <- (w %o% w) * (sigma %o% sigma)
+diag(rw_matrix) <- 0
+risk_weighted_avg_corr <- sum(rw_matrix * correlation_matrix) / sum(rw_matrix)
+
+# ── Top risk-weighted correlated pairs ────────────────────────────────────────
+pair_idx <- which(upper.tri(correlation_matrix), arr.ind = TRUE)
+risk_weighted_pairs <- tibble(
+  ticker1 = rwd_tickers[pair_idx[, 1]],
+  ticker2 = rwd_tickers[pair_idx[, 2]],
+  correlation = correlation_matrix[pair_idx],
+  combined_weight_pct = (w[pair_idx[, 1]] * w[pair_idx[, 2]]) * 100,
+  risk_contribution = w[pair_idx[, 1]] * w[pair_idx[, 2]] *
+    sigma[pair_idx[, 1]] * sigma[pair_idx[, 2]] * correlation_matrix[pair_idx]
+) |>
+  mutate(risk_contribution_pct = risk_contribution / sum(rw_matrix * correlation_matrix) * 100) |>
+  arrange(desc(risk_contribution)) |>
+  slice_head(n = 8)
+
+risk_weighted_pairs_display <- risk_weighted_pairs |>
+  transmute(
+    `Ticker 1` = ticker1,
+    `Ticker 2` = ticker2,
+    Correlation = round(correlation, 2),
+    `Combined Weight` = paste0(round(combined_weight_pct, 1), "%"),
+    `Risk Contribution` = paste0(round(risk_contribution_pct, 1), "%")
+  )
+
+# ── Chart: diversification benefit (undiversified vs. diversified volatility) ─
+vol_compare <- tibble(
+  Scenario = factor(c("Undiversified (ρ = 1)", "Diversified (actual)"),
+                     levels = c("Undiversified (ρ = 1)", "Diversified (actual)")),
+  Volatility = c(sigma_undiv, sigma_p) * 100
+)
+
+vol_compare_plot <- ggplot(vol_compare, aes(Scenario, Volatility, fill = Scenario)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = paste0(round(Volatility, 1), "%")), vjust = -0.5, size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("#E63946", "#457B9D"), guide = "none") +
+  labs(title = "Diversification Benefit",
+       subtitle = paste0("Diversification ratio ", round(diversification_ratio_true, 2),
+                          "x — correlation lowers volatility by ",
+                          round((1 - sigma_p / sigma_undiv) * 100, 1), "%"),
+       x = NULL, y = "Annualized Volatility (%)") +
+  theme_minimal() +
+  theme_report() +
+  theme(axis.text.x = element_text(size = 10),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(color = "#EEEEEE", linewidth = 0.3),
+        plot.margin = margin(l = 10, r = 10, t = 10, b = 10))
+print(vol_compare_plot)
+
+# ── Chart: top risk-weighted correlated pairs ─────────────────────────────────
+pairs_plot <- risk_weighted_pairs |>
+  mutate(pair_label = paste0(ticker1, " – ", ticker2)) |>
+  ggplot(aes(x = reorder(pair_label, risk_contribution_pct), y = risk_contribution_pct, fill = correlation)) +
+  geom_col() +
+  scale_fill_gradient2(midpoint = 0, low = "#1a9850", mid = "white", high = "#d73027",
+                        limits = c(-1, 1), name = "Correlation") +
+  coord_flip() +
+  labs(title = "Top Holding Pairs by Risk-Weighted Correlation Contribution",
+       subtitle = "Share of total risk-weighted correlation (weight × weight × volatility × volatility × ρ)",
+       x = NULL, y = "Share of Risk-Weighted Correlation (%)") +
+  theme_minimal() +
+  theme_report() +
+  theme(axis.text.y = element_text(size = 9), axis.text.x = element_text(size = 9),
+        legend.position = "right",
+        panel.grid.major.x = element_line(color = "#EEEEEE", linewidth = 0.3),
+        panel.grid.major.y = element_blank(),
+        plot.margin = margin(l = 10, r = 10, t = 10, b = 10))
+print(pairs_plot)
+
+knitr::kable(risk_weighted_pairs_display,
+  caption = "Holding Pairs Contributing Most to Portfolio Risk via Correlation")
+```
+
+A diversification ratio of 1.0 would mean the portfolio gets no benefit from diversification (all holdings move in lockstep); `r cfg$display_name` achieves `r round(diversification_ratio_true, 2)`, meaning realized (diversified) volatility of `r round(sigma_p * 100, 1)`% is `r round((1 - sigma_p / sigma_undiv) * 100, 1)`% lower than the `r round(sigma_undiv * 100, 1)`% it would be if all holdings were perfectly correlated. The risk-weighted average correlation — weighting each pair by how much it actually contributes to portfolio variance — is `r round(risk_weighted_avg_corr, 2)`, compared with the unweighted average of `r round(mean(lower_tri), 2)` above; the table lists the specific holding pairs driving the largest share of correlated risk.
+
+#### 2.3.1 Marginal Risk Contribution (correlation-aware, full priced universe)
+
+A holding's `weight × standalone volatility` is only a fair share of risk if all holdings are perfectly correlated. The Euler decomposition used here, `RC_i = w_i × (Σw)_i / σ_p`, accounts for how each holding actually moves with the rest of the portfolio: the contributions sum **exactly** to portfolio volatility, a volatile but diversifying holding gets a small share, and a hedge can go negative.
+
+It is computed over every held ticker with a current price history, not just the top holdings shown in the heatmap above. With well over a hundred assets and only about a year of daily data, the plain sample correlation matrix is noisy (and singular whenever assets outnumber days), so it is **shrunk towards zero correlation** with the Ledoit-Wolf estimator; volatilities are each series' own annualized standard deviation over the same shared dates.
+
+```{r marginal-risk-contribution, echo=FALSE}
+# Universe: held tickers with prices, still updating (a stale series would cut
+# every other ticker's shared history to its own end date), and enough history.
+# Holdings without such a series have no correlation estimate and are EXCLUDED,
+# not given an assumed one - the shares describe the covered part only.
+mrc_ticker_weight <- ticker_summary %>%
+  group_by(ticker) %>%
+  summarise(weight_pct = sum(weight_pct), .groups = "drop")
+
+mrc_returns      <- covered_panel   # built once in 2.1: the held tickers with a current price history
+mrc_stale_n      <- length(attr(mrc_returns, "stale_tickers"))
+mrc_matrix  <- as.matrix(select(mrc_returns, -Date))
+mrc_lw      <- shrink_correlation_lw(mrc_matrix)
+mrc_sigma   <- apply(mrc_matrix, 2, sd) * sqrt(periods_per_year(mrc_returns$Date))
+
+mrc_weights <- mrc_ticker_weight$weight_pct[match(colnames(mrc_matrix), mrc_ticker_weight$ticker)]
+names(mrc_weights) <- colnames(mrc_matrix)
+
+mrc <- compute_marginal_risk_contribution(mrc_weights, mrc_sigma, mrc_lw$correlation)
+stopifnot(abs(sum(mrc$table$risk_contribution) - mrc$portfolio_vol) < 1e-9)
+
+mrc_coverage_pct <- sum(mrc_weights) / sum(mrc_ticker_weight$weight_pct) * 100
+
+mrc_table <- mrc$table %>%
+  left_join(portfolio_risk %>% distinct(ticker, .keep_all = TRUE) %>% select(ticker, name), by = "ticker") %>%
+  left_join(portfolio %>% group_by(ticker) %>% summarise(pname = first(name), .groups = "drop"), by = "ticker") %>%
+  mutate(
+    name = coalesce(name, pname),
+    weight_pct = weight * 100,
+    standalone_share_pct = weight * sigma / sum(weight * sigma) * 100,
+    risk_intensity = risk_contribution_pct / weight_pct,
+    label = paste0(ticker, " - ", str_trunc(name, 22, side = "right"))
+  )
+
+mrc_top20 <- mrc_table %>% slice_max(risk_contribution_pct, n = 20)
+mrc_top   <- mrc_table %>% slice_max(risk_contribution_pct, n = 1)
+mrc_negative <- mrc_table %>% filter(risk_contribution_pct < 0)
+
+mrc_plot <- mrc_top20 %>%
+  ggplot(aes(x = reorder(label, risk_contribution_pct), y = risk_contribution_pct)) +
+  geom_col(aes(fill = risk_contribution_pct >= 0), width = 0.7) +
+  geom_point(aes(y = weight_pct, shape = "Weight share"), size = 2.5, colour = "#222222") +
+  scale_fill_manual(values = c(`TRUE` = "#457B9D", `FALSE` = "#1a9850"), guide = "none") +
+  scale_shape_manual(values = c("Weight share" = 18), name = NULL) +
+  coord_flip() +
+  labs(title = "Marginal Risk Contribution: 20 Largest Contributors",
+       subtitle = paste0("Bars: share of portfolio volatility (sums to 100% over all ", nrow(mrc_table),
+                         " holdings). Diamonds: share of weight. Bar right of its diamond = more risk than weight."),
+       x = NULL, y = "% of covered portfolio") +
+  theme_minimal() +
+  theme_report(subtitle_size = 9) +
+  theme(axis.text.y = element_text(size = 8), axis.text.x = element_text(size = 9),
+        legend.position = "bottom",
+        panel.grid.major.x = element_line(color = "#EEEEEE", linewidth = 0.3),
+        panel.grid.major.y = element_blank(),
+        plot.margin = margin(l = 10, r = 10, t = 10, b = 10))
+print(mrc_plot)
+
+mrc_top20 %>%
+  transmute(
+    Ticker = ticker, Company = str_trunc(name, 26, side = "right"),
+    `Weight (%)` = round(weight_pct, 1), `Vol (%)` = round(sigma * 100, 1),
+    `Standalone Share (w×σ, %)` = round(standalone_share_pct, 1),
+    `Marginal Risk Share (%)` = round(risk_contribution_pct, 1),
+    `Risk / Weight (×)` = round(risk_intensity, 2)
+  ) %>%
+  knitr::kable(caption = "20 Largest Marginal Risk Contributors vs. Standalone Share (covered holdings)") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+# Risk vs. weight by sector (sectors of the covered holdings)
+mrc_table %>%
+  with_sector() %>%
+  group_by(Sector = sector) %>%
+  summarise(`Weight (%)` = sum(weight_pct), `Marginal Risk Share (%)` = sum(risk_contribution_pct),
+            Holdings = n(), .groups = "drop") %>%
+  mutate(`Risk / Weight (×)` = `Marginal Risk Share (%)` / `Weight (%)`,
+         across(where(is.numeric), ~ round(.x, 1))) %>%
+  arrange(desc(`Marginal Risk Share (%)`)) %>%
+  knitr::kable(caption = "Marginal Risk Share by Sector (covered holdings)") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+The `r nrow(mrc_table)` holdings with a current price history cover **`r round(mrc_coverage_pct, 1)`%** of the portfolio's allocated weight, over `r nrow(mrc_returns)` shared trading days (`r format(min(mrc_returns$Date))` to `r format(max(mrc_returns$Date))`); the covered part's volatility is `r round(mrc$portfolio_vol * 100, 1)`%. The rest — Cash, low-risk bonds, positions without cached prices, and `r mrc_stale_n` held series that stopped updating — has no correlation estimate and is excluded rather than given an assumed one. The Ledoit-Wolf shrinkage intensity is `r round(mrc_lw$shrinkage, 2)` (0 = raw sample correlations, 1 = all assets uncorrelated); the estimate is still noisy with `r mrc_lw$n_assets` assets and `r mrc_lw$n_obs` observations, so read shares of a few percent as ranges, not points. The largest single contributor is **`r mrc_top$ticker`** with `r round(mrc_top$risk_contribution_pct, 1)`% of risk on `r round(mrc_top$weight_pct, 1)`% of weight. `r if (nrow(mrc_negative) > 0) paste0(nrow(mrc_negative), " holding(s) reduce portfolio risk (negative contribution), the largest being ", mrc_negative$ticker[which.min(mrc_negative$risk_contribution_pct)], ".") else "No holding has a negative contribution, i.e. none acts as a net hedge."`
+
+### 2.4 Diversification Metrics
+
+```{r diversification-metrics-summary}
+diversif_summary <- tibble(
+  Metric = c(
+    "Equity Positions (unique)",
+    "Effective Number of Equity Positions",
+    "Herfindahl Index (equities)",
+    "Effective Number of Asset Classes",
+    "Diversified Volatility (largest priced holdings)",
+    "Undiversified Volatility, ρ=1 (largest priced holdings)",
+    "Diversification Ratio (largest priced holdings)",
+    "Risk-Weighted Average Correlation (largest priced holdings)",
+    "Equity Concentration (HHI)"
+  ),
+  Value = c(
+    paste0(equity_concentration$n),
+    paste0(round(effective_num_holdings, 1)),
+    paste0(round(herfindahl_index, 4)),
+    paste0(round(1 / sum((asset_class_pct$weight / 100)^2), 1)),
+    paste0(round(sigma_p * 100, 1), "%"),
+    paste0(round(sigma_undiv * 100, 1), "%"),
+    paste0(round(diversification_ratio_true, 2), "x"),
+    paste0(round(risk_weighted_avg_corr, 2)),
+    case_when(
+      herfindahl_index < 0.05 ~ "Low",
+      herfindahl_index < 0.10 ~ "Moderate",
+      TRUE ~ "High"
+    )
+  ),
+  Interpretation = c(
+    paste0("Distinct equity positions (look-through); gold, crypto, cash and bonds are asset classes, not positions in this count. The equity part is ",
+           round(equity_weight_pct, 1), "% of the portfolio"),
+    "Number of equally sized equity positions that would give the same concentration (1 / HHI, within the equity part)",
+    "Concentration of the equity part (0 = perfect diversification, 1 = single holding)",
+    "The same measure across the asset classes (equities, gold, crypto, bonds, cash); 5 = evenly split, 1 = a single class",
+    "Annualized volatility of the largest priced holdings only, incorporating return correlation (Section 2.3); the whole portfolio's is in Section 2.1",
+    "Volatility if all holdings were perfectly correlated (weight x standalone volatility)",
+    "Undiversified / diversified volatility (>1; higher = more benefit from correlation)",
+    "Average pairwise correlation weighted by each pair's contribution to portfolio risk",
+    "Risk category based on the Herfindahl index of the equity part"
+  )
+)
+
+knitr::kable(diversif_summary, caption = "Portfolio Diversification Metrics")
+```
+
+### 2.5 Portfolio Risk Profile Summary
+
+```{r risk-summary-table}
+risk_summary <- tibble(
+  Metric = c(
+    "Effective Number of Equity Positions",
+    "Largest Asset Class",
+    "Top Single Equity",
+    "Top 5 Equities",
+    "Top 10 Equities",
+    "Sector Classification (equities)",
+    "Top 3 Equity Countries",
+    "USD Exposure (listing currency)",
+    "EUR Exposure (listing currency)",
+    "Unclassified Equities"
+  ),
+  Value = c(
+    paste0(round(effective_num_holdings, 1), " positions"),
+    paste0(asset_class_pct$asset_class[1], " ", round(asset_class_pct$weight[1], 1), "% of the portfolio"),
+    paste0(round(top_1_weight, 2), "% of the equities"),
+    paste0(round(top_5_weight, 2), "% of the equities"),
+    paste0(round(top_10_weight, 2), "% of the equities"),
+    paste0(sector_coverage_pct, "% of the equity weight (classified)"),
+    paste0(round(country_concentration, 2), "% of the equities"),
+    paste0(round(usd_exposure, 2), "%"),
+    paste0(round(eur_exposure, 2), "%"),
+    paste0(round(100 - sector_coverage_pct, 1), "%")
+  ),
+  Assessment = c(
+    case_when(
+      effective_num_holdings > 30 ~ "✓ Well-diversified",
+      effective_num_holdings > 15 ~ "◐ Moderate",
+      TRUE ~ "⚠ Concentrated"
+    ),
+    case_when(
+      asset_class_pct$weight[1] < 50 ~ "✓ Mixed",
+      asset_class_pct$weight[1] < 75 ~ "◐ One class leads",
+      TRUE ~ "⚠ One class dominates"
+    ),
+    case_when(
+      top_1_weight < 5 ~ "✓ Low",
+      top_1_weight < 10 ~ "◐ Moderate",
+      TRUE ~ "⚠ High"
+    ),
+    case_when(
+      top_5_weight < 20 ~ "✓ Low",
+      top_5_weight < 35 ~ "◐ Moderate",
+      TRUE ~ "⚠ High"
+    ),
+    case_when(
+      top_10_weight < 35 ~ "✓ Low",
+      top_10_weight < 50 ~ "◐ Moderate",
+      TRUE ~ "⚠ High"
+    ),
+    case_when(
+      sector_coverage_pct >= 80 ~ "✓ Good coverage",
+      sector_coverage_pct >= 50 ~ "◐ Partial coverage",
+      TRUE ~ "⚠ Limited coverage"
+    ),
+    case_when(
+      country_concentration < 30 ~ "✓ Diversified",
+      country_concentration < 50 ~ "◐ Moderate",
+      TRUE ~ "⚠ Concentrated"
+    ),
+    case_when(
+      usd_exposure > 30 & usd_exposure < 70 ~ "✓ Balanced",
+      TRUE ~ "◐ Consider review"
+    ),
+    case_when(
+      eur_exposure > 10 & eur_exposure < 50 ~ "✓ Balanced",
+      TRUE ~ "◐ Consider review"
+    ),
+    case_when(
+      sector_coverage_pct >= 80 ~ "✓ Good",
+      TRUE ~ "⚠ Data gaps"
+    )
+  )
+)
+
+knitr::kable(risk_summary, caption = "Portfolio Risk Profile & Concentration Analysis")
+
+currency_exposure %>%
+  transmute(
+    `Trading Currency` = currency,
+    `Weight (%)` = round(weight, 2),
+    `Share of Allocated Weight (%)` = round(weight / sum(weight) * 100, 1),
+    Holdings = holdings
+  ) %>%
+  knitr::kable(caption = paste0(
+    "Currency Exposure by Trading Currency (EUR investor: every non-EUR row carries FX risk; ",
+    round(currency_inferred_pct, 1), "% of weight uses its country's currency as an estimate, ",
+    round(currency_unassigned_pct, 1), "% has no currency assigned. USD contains ",
+    round(usd_breakdown_pct[["us"]], 1), "% US-domiciled companies, ",
+    round(usd_breakdown_pct[["pseudo"]], 1), "% USD-priced gold/crypto and ",
+    round(usd_breakdown_pct[["other"]], 1), "% non-US companies with a US listing)"
+  ))
+```
+
+------------------------------------------------------------------------
+
+## 3. Geographic Distribution
+
+### 3.1 Portfolio Weights by Country
+
+The following analysis shows how the **equity part** of the portfolio (`r round(equity_weight_pct, 1)`% of the weight) is distributed across countries, based on the primary listing location of the holdings. Gold, crypto, cash and bonds are asset classes, not countries, and are left out here (`r round(100 - equity_weight_pct, 1)`% of the weight; see Sections 1.1 and 2.1).
+
+```{r country-aggregation}
+ggplot(country_summary |> head(15), aes(x = reorder(country_name, weight_pct), y = weight_pct)) +
+  geom_col(fill = "#2E86AB", alpha = 0.8) +
+  coord_flip() +
+  labs(
+    title = "Equity Allocation by Country (Top 15)",
+    subtitle = paste0("Weight in % of the whole portfolio; the bars of all countries add up to ", round(equity_weight_pct, 1), "%"),
+    x = NULL,
+    y = "Weight (% of portfolio)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 10, color = "#666666", margin = margin(b = 10)),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.x = element_line(color = "#EEEEEE", linewidth = 0.3),
+    panel.grid.major.y = element_blank()
+  )
+
+```
+
+Geographic allocation of the equities is led by **`r top_country_name`** (`r round(top_country_equity_share, 1)`% of the equities, `r round(top_country_weight, 1)`% of the portfolio), with the top three markets — `r top3_country_names` — together accounting for **`r round(country_concentration, 1)`%** of the equities. By trading currency the portfolio is roughly `r round(usd_exposure, 1)`% USD and `r round(eur_exposure, 1)`% EUR (unhedged; the full split is in the currency exposure table in Section 2, `r round(currency_inferred_pct, 1)`% of weight uses its country's currency as an estimate and `r round(currency_unassigned_pct, 1)`% has no currency assigned).
+
+------------------------------------------------------------------------
+
+## 4. Holdings Analysis
+
+```{r ticker-analysis}
+top_holdings <- ticker_summary |>
+  head(20) |>
+  select(ticker, name, country_code, weight_pct, index) |>
+  rename(
+    Ticker         = ticker,
+    `Company Name` = name,
+    Country        = country_code,
+    `Weight (%)`   = weight_pct,
+    `Fund Source`  = index
+  )
+
+knitr::kable(top_holdings, digits = 2, caption = paste0("Top 20 Holdings: ", cfg$display_name)) |>
+  kableExtra::kable_styling(full_width = FALSE) |>
+  kableExtra::column_spec(3, width = "4em") |>
+  kableExtra::column_spec(4, width = "8em") |>
+  kableExtra::column_spec(5, width = "14em")
+```
+
+The top holdings represent the largest individual positions in the portfolio, typically spanning multiple indexes within the composite allocation. This diversification across multiple funds reduces concentration risk.
+
+------------------------------------------------------------------------
+
+## 5. Sector Composition
+
+Sector classifications are limited: **`r sector_coverage_pct`%** of the equity weight is classified. Non-classified stocks appear as "Unclassified" below. Gold, crypto, cash and bonds have no GICS sector and appear as their own pseudo-sectors (Commodities, Digital Assets, Cash & Equivalents, Fixed Income); they are not counted in the coverage figure.
+
+```{r sector-sunburst}
+# Prepare hierarchical data: Sector -> Industry -> Top 3 Holdings per Industry
+sunburst_df <- portfolio %>%
+  with_sector(include_industry = TRUE) %>%
+  select(ticker, name, sector, industry, weight)
+
+# 1. Sector level (root)
+sector_level <- sunburst_df %>%
+  group_by(sector) %>%
+  summarise(weight = sum(weight), .groups = "drop") %>%
+  mutate(
+    id = sector,
+    label = sector,
+    parent = ""
+  ) %>%
+  select(id, label, parent, weight)
+
+# 2. Industry level (second level)
+industry_level <- sunburst_df %>%
+  group_by(sector, industry) %>%
+  summarise(weight = sum(weight), .groups = "drop") %>%
+  mutate(
+    id = paste(sector, industry, sep = " | "),
+    label = industry,
+    parent = sector
+  ) %>%
+  select(id, label, parent, weight)
+
+# 3. Top 3 holdings per industry (leaf level)
+top3_holdings <- sunburst_df %>%
+  group_by(sector, industry) %>%
+  slice_max(weight, n = 3) %>%
+  mutate(
+    id = paste(sector, industry, ticker, sep = " | "),
+    label = name,
+    parent = paste(sector, industry, sep = " | ")
+  ) %>%
+  select(id, label, parent, weight = weight) %>%
+  ungroup()
+
+# Combine into a flat structure for plotly
+sunburst_final <- bind_rows(sector_level, industry_level, top3_holdings)
+
+render_plotly_hierarchy(
+  sunburst_final,
+  type = "sunburst",
+  title = "Portfolio Allocation: Sector → Industry → Top 3 Holdings",
+  fallback_msg = "_Interactive sunburst chart (Sector → Industry → Top 3 Holdings) is only available in the HTML version of this report._",
+  textposition = "inside"
+)
+```
+
+------------------------------------------------------------------------
+
+## 6. Advanced Visualizations & Performance
+
+This section extends the static allocation analysis above with time-series views: how the portfolio has performed against public benchmarks, how risk and return are distributed across sectors, and which individual holdings sit on which side of the portfolio's own risk/return position.
+
+```{r adv-viz-setup, include=FALSE}
+
+# Ticker-level weights, deduped by ticker (ticker_summary groups by
+# ticker+alpha3; a ticker could in principle appear under >1 alpha3 —
+# price series are keyed by ticker only, so sum those together first).
+ticker_weights_all <- ticker_summary %>%
+  group_by(ticker) %>%
+  summarise(weight_pct = sum(weight_pct), .groups = "drop")
+
+# Full priced universe: every portfolio ticker with >=100 cached daily
+# observations, NOT limited to the tornado chart's top-20 — the fetch
+# pipeline (get_price_data.R) already covers the whole portfolio, so this
+# uses whatever is actually cached rather than an artificial subset.
+portfolio_returns_wide <- covered_panel
+priced_tickers <- setdiff(names(portfolio_returns_wide), "Date")
+
+weight_vec <- ticker_weights_all %>%
+  filter(ticker %in% priced_tickers) %>%
+  { setNames(.$weight_pct, .$ticker) }
+
+portfolio_weight_coverage_pct <- sum(weight_vec) / sum(ticker_weights_all$weight_pct) * 100
+
+# The portfolio's return path is the sleeve model's (2.1), measured on the same dates
+# (the first row is the baseline with return 0).
+portfolio_return_series <- sleeve_model$portfolio
+
+# Benchmarks
+benchmark_returns_wide <- build_return_panel(closing_prices_clean, tickers = BENCHMARK_TICKERS)
+available_benchmarks   <- setdiff(names(benchmark_returns_wide), "Date")
+
+if (length(available_benchmarks) == 0) {
+  cat("\n=== No benchmark price data cached yet — run get_price_data.R to fetch",
+      "SPY/URTH/EEM, then re-knit ===\n")
+}
+```
+
+### 6.1 Cumulative Returns vs. Benchmarks
+
+```{r cumulative-returns-calc}
+if (length(available_benchmarks) == 0) {
+  stop("No benchmark price data cached. Run get_price_data.R to fetch SPY/URTH/EEM first.")
+}
+
+# The portfolio's return dates inside the benchmarks' history. The benchmarks trade on more days
+# than the portfolio panel keeps (it needs a price for every holding), so their returns are summed
+# up to each of these dates below rather than filtered to them.
+common_dates <- as.Date(
+  portfolio_return_series$Date[portfolio_return_series$Date >= min(benchmark_returns_wide$Date) &
+                                 portfolio_return_series$Date <= max(benchmark_returns_wide$Date)],
+  origin = "1970-01-01"
+)
+
+# 6.1-6.4 run on common_dates, which is the sleeve model's window unless the benchmarks start later
+# than the panel; then the model is re-run on the shorter window.
+sleeve_window <- if (setequal(sleeve_model$portfolio$Date, common_dates)) sleeve_model else
+  compute_sleeve_model(sleeves, closing_prices_clean, common_dates, sleeve_assumptions)
+
+cumret_portfolio <- sleeve_window$portfolio %>%
+  filter(Date %in% common_dates) %>%
+  arrange(Date) %>%
+  mutate(cumulative_return = rebase_to_one(exp(cumsum(portfolio_return)))) %>%
+  transmute(Date, series = cfg$display_name, cumulative_return)
+
+cumret_benchmarks <- aggregate_returns_to_dates(benchmark_returns_wide, common_dates) %>%
+  pivot_longer(-Date, names_to = "series", values_to = "log_return") %>%
+  group_by(series) %>%
+  arrange(Date) %>%
+  mutate(cumulative_return = exp(cumsum(log_return))) %>%   # first date is the baseline (return 0)
+  ungroup() %>%
+  select(Date, series, cumulative_return)
+
+cumret_combined <- bind_rows(cumret_portfolio, cumret_benchmarks)
+
+series_colors <- c(SPY = "#2E86AB", URTH = "#457B9D", EEM = "#E9A036")
+series_colors[[cfg$display_name]] <- "#A23B72"
+
+final_returns <- cumret_combined %>%
+  group_by(series) %>%
+  slice_max(Date, n = 1) %>%
+  ungroup() %>%
+  mutate(total_return_pct = (cumulative_return - 1) * 100) %>%
+  arrange(desc(total_return_pct))
+
+portfolio_total_return_pct <- final_returns %>% filter(series == cfg$display_name) %>% pull(total_return_pct)
+best_benchmark_row <- final_returns %>% filter(series != cfg$display_name) %>% slice_max(total_return_pct, n = 1)
+```
+
+```{r cumulative-returns-plot}
+ggplot(cumret_combined, aes(x = Date, y = cumulative_return - 1, color = series)) +
+  geom_line(linewidth = 0.9) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_manual(values = series_colors, name = NULL) +
+  labs(
+    title = "Cumulative Return: Portfolio vs. Benchmarks",
+    subtitle = paste0(
+      "Whole portfolio from its fund, gold, crypto and stock series (", round(sleeve_window$coverage_pct, 1),
+      "% of weight; cash and bonds at assumed returns), ",
+      format(min(common_dates), "%b %Y"), " – ", format(max(common_dates), "%b %Y")
+    ),
+    x = NULL, y = "Cumulative Return"
+  ) +
+  theme_minimal() +
+  theme_report() +
+  theme(legend.position = "bottom",
+        panel.grid.major.x = element_line(color = "#EEEEEE", linewidth = 0.3))
+```
+
+```{r cumulative-returns-insights, results='asis'}
+cat("**Cumulative Performance:**\n\n")
+final_returns %>%
+  pwalk(function(series, total_return_pct, ...) {
+    cat("- **", series, "**: ", round(total_return_pct, 1), "% cumulative return\n", sep = "")
+  })
+
+cat("\n**Interpretation:**\n\n")
+cat(cfg$display_name, " ",
+    if_else(portfolio_total_return_pct >= best_benchmark_row$total_return_pct,
+            "outperformed", "trailed"),
+    " its strongest tracked benchmark, **", best_benchmark_row$series, "** (",
+    round(best_benchmark_row$total_return_pct, 1), "%), over the ",
+    format(min(common_dates), "%B %Y"), "–", format(max(common_dates), "%B %Y"),
+    " window. The portfolio is modelled with ", round(sleeve_window$coverage_pct, 1),
+    "% of its weight (Section 2.1); ", round(non_equity_pct, 1), "% of it is gold, crypto, bonds and cash, ",
+    "which these equity indices do not contain, so the gap to them is not a stock-selection result.\n",
+    sep = "")
+```
+
+```{r reference-points, include=FALSE}
+# One analysis window for 6.2-6.4: the portfolio's return dates inside the benchmarks' history
+# (6.1's common_dates). The portfolio, every holding and every benchmark are annualized over
+# exactly these dates, so their returns and volatilities can be compared with each other.
+# (Holdings used to be measured over their own, partly longer histories against a portfolio
+# point on the shared panel, e.g. GLD at -3% p.a. in 6.2-6.4 but -20% on the panel.)
+window_returns <- portfolio_returns_wide %>% filter(Date %in% common_dates)
+window_k       <- periods_per_year(window_returns$Date)
+holding_window_stats <- annualize_returns(window_returns, window_k)
+
+# The whole portfolio's point (sleeve model, 2.1), on the same footing as the holdings and benchmarks.
+real_portfolio_point <- tibble(
+  label = cfg$display_name,
+  volatility = sleeve_window$volatility_pct,
+  return = sleeve_window$annual_return_pct
+)
+
+# Benchmarks: their daily returns summed up to the window's dates (as in 6.1); the first date
+# is the baseline, so n - 1 steps over the same span and the same observations per year.
+benchmark_points <- annualize_returns(
+  aggregate_returns_to_dates(benchmark_returns_wide, common_dates)[-1, ], window_k
+) %>%
+  transmute(label = ticker, volatility = volatility_pct, return = annual_return_pct)
+```
+
+### 6.2 Sector Contribution to Risk & Return
+
+Sections 6.2-6.4 measure every holding, the portfolio and the benchmarks over the same window as 6.1 (`r format(min(common_dates))` to `r format(max(common_dates))`, `r nrow(window_returns)` return dates), so a holding's return and volatility can be compared directly with the portfolio's and the benchmark's.
+
+```{r sector-bubble-calc, include=FALSE}
+sector_bubble_data <- ticker_weights_all %>%
+  filter(ticker %in% priced_tickers) %>%
+  with_sector() %>%
+  left_join(holding_window_stats %>% select(ticker, volatility_pct, annual_return = annual_return_pct), by = "ticker") %>%
+  filter(!is.na(volatility_pct), !is.na(annual_return))
+
+sector_bubble_summary <- sector_bubble_data %>%
+  group_by(sector) %>%
+  summarise(
+    weight = sum(weight_pct),
+    avg_return = weighted.mean(annual_return, weight_pct),
+    avg_volatility = weighted.mean(volatility_pct, weight_pct),
+    n_holdings = n(),
+    .groups = "drop"
+  )
+
+top_weight_sector <- sector_bubble_summary %>% slice_max(weight, n = 1)
+top_return_sector <- sector_bubble_summary %>% slice_max(avg_return, n = 1)
+top_vol_sector    <- sector_bubble_summary %>% slice_max(avg_volatility, n = 1)
+```
+
+```{r sector-bubble-plot, fig.height=7}
+ggplot(sector_bubble_summary, aes(x = avg_return, y = avg_volatility, size = weight, color = sector)) +
+  geom_point(alpha = 0.75) +
+  scale_size_continuous(range = c(4, 20), name = "Portfolio Weight (%)") +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(
+    title = "Sector Contribution to Risk & Return",
+    subtitle = paste0(scales::comma(nrow(sector_bubble_data)), " priced holdings (",
+                       round(portfolio_weight_coverage_pct, 1), "% of portfolio weight)"),
+    x = "Annualized Return (%)", y = "Annualized Volatility (%)"
+  ) +
+  theme_minimal() +
+  theme_report() +
+  theme(legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+```
+
+```{r sector-bubble-insights, results='asis'}
+cat("**Sector Risk/Return Highlights:**\n\n")
+cat("- **Largest Sector Weight**: ", top_weight_sector$sector[1], " (",
+    round(top_weight_sector$weight[1], 1), "% of portfolio)\n", sep = "")
+cat("- **Highest Average Return**: ", top_return_sector$sector[1], " (",
+    round(top_return_sector$avg_return[1], 1), "% annualized)\n", sep = "")
+cat("- **Highest Average Volatility**: ", top_vol_sector$sector[1], " (",
+    round(top_vol_sector$avg_volatility[1], 1), "% annualized)\n\n", sep = "")
+
+cat("**Interpretation:**\n\n")
+cat("Bubble size reflects each sector's share of portfolio weight; position shows the ",
+    "weighted-average historical return and volatility of its priced holdings. Sectors in ",
+    "the upper-left combine below-average return with above-average volatility — a weaker ",
+    "risk/return trade-off than sectors toward the lower-right.\n", sep = "")
+```
+
+### 6.3 Holding-Level Risk/Return Positioning
+
+The scatter below plots every priced holding by its own annualized volatility and return, classified relative to the portfolio's own current risk/return position (computed from the daily series behind Section 6.1). Bubble size reflects portfolio weight; hover for details. Unlike Section 6.2's sector-level view, this is a per-ticker view, so it can identify individual holdings — not just sectors — that are pulling the portfolio toward a stronger or weaker risk/return trade-off.
+
+```{r holding-positioning-calc, include=FALSE}
+# Ticker -> company name lookup, deduped (ticker_summary is grouped by
+# ticker+alpha3, so a ticker can repeat across countries; sector_bubble_data
+# itself has no name column, since it's built from ticker_weights_all).
+ticker_name_lookup <- ticker_summary %>%
+  distinct(ticker, .keep_all = TRUE) %>%
+  select(ticker, name)
+
+ref_vol    <- real_portfolio_point$volatility
+ref_return <- real_portfolio_point$return
+
+positioning_available <- is.finite(ref_vol) && is.finite(ref_return) &&
+  nrow(sector_bubble_data) > 0
+
+if (positioning_available) {
+  holding_positioning <- sector_bubble_data %>%
+    left_join(ticker_name_lookup, by = "ticker") %>%
+    mutate(
+      name = coalesce(name, ticker),
+      quadrant = case_when(
+        volatility_pct < ref_vol & annual_return > ref_return ~ "Improves risk/return",
+        volatility_pct > ref_vol & annual_return < ref_return ~ "Drags risk/return",
+        volatility_pct > ref_vol & annual_return > ref_return ~ "Higher risk, higher return",
+        volatility_pct < ref_vol & annual_return < ref_return ~ "Lower risk, lower return",
+        TRUE ~ "At portfolio position"
+      ),
+      quadrant = factor(quadrant, levels = c(
+        "Improves risk/return", "Higher risk, higher return",
+        "Lower risk, lower return", "Drags risk/return",
+        "At portfolio position"
+      )),
+      risk_return_score = (annual_return - ref_return) - (volatility_pct - ref_vol),
+      weighted_impact    = risk_return_score * weight_pct
+    )
+
+  # Disjoint top/bottom slices, capped at 10 but never overlapping on small
+  # portfolios (e.g. "portfolio_b", with far fewer priced holdings than "portfolio_a").
+  n_table <- min(10L, nrow(holding_positioning) %/% 2L)
+
+  worst_holdings <- if (n_table > 0) slice_min(holding_positioning, weighted_impact, n = n_table, with_ties = FALSE) else holding_positioning[0, ]
+  best_holdings  <- if (n_table > 0) slice_max(holding_positioning, weighted_impact, n = n_table, with_ties = FALSE) else holding_positioning[0, ]
+
+  # Strictly better than the portfolio on BOTH axes at once (unlike
+  # best_holdings, which ranks by weighted_impact and can include a "Higher
+  # risk, higher return" holding whose excess return outweighs its excess
+  # risk) - a separate, stricter list, up to 10, not capped/split against
+  # worst_holdings since it's a quadrant filter rather than a top/bottom
+  # slice of the same pool.
+  pure_improvers_pool <- filter(holding_positioning, quadrant == "Improves risk/return")
+  n_pure_improvers <- min(10L, nrow(pure_improvers_pool))
+  pure_improvers <- if (n_pure_improvers > 0) {
+    slice_max(pure_improvers_pool, weighted_impact, n = n_pure_improvers, with_ties = FALSE)
+  } else {
+    holding_positioning[0, ]
+  }
+
+  label_tickers <- union(union(worst_holdings$ticker, best_holdings$ticker), pure_improvers$ticker)
+} else {
+  n_table <- 0L
+  n_pure_improvers <- 0L
+}
+```
+
+```{r multiagent-export, include=FALSE}
+# Export for the multi-agent system (see CLAUDE.md and multi-agent/CLAUDE.md): sheet 1 is the
+# selected positions (weight, risk, hedges, picks, non-equity blocks) merged with the holding-level
+# positioning (build_multiagent_export()),
+# the other sheets carry the report's own figures - whole-portfolio model, asset classes, equity
+# sectors/countries, currency, drawdown, caveats - so the multi-agent system interprets them
+# instead of recomputing them (build_multiagent_sheets()). Falls back to the old weight-only
+# positions sheet if positioning data couldn't be built (e.g. real_portfolio_point is NA), so
+# multi-agent still gets a file on this render instead of a stale or missing one.
+# Which positions are listed individually: weight, risk, hedges, risk/return picks and every
+# non-equity block (select_export_tickers(), multiagent_export.R).
+export_selection <- select_export_tickers(
+  ticker_summary, mrc_table,
+  pick_tickers = if (positioning_available) label_tickers else character(0)
+)
+export_positions <- if (positioning_available) {
+  # risk_contribution (the tornado table) is limited to the top 20; give every other listed row a beta too
+  extra_beta <- batch_calculate_market_beta(setdiff(export_selection$ticker, risk_contribution$ticker),
+                                            prices_df = closing_prices_clean, benchmark = "URTH")
+  build_multiagent_export(risk_contribution, holding_positioning, export_selection,
+                          ticker_summary %>% with_sector(), extra_beta = extra_beta)
+} else {
+  tornado_data
+}
+export_sectors <- equity_summary %>%
+  with_sector() %>%
+  group_by(sector) %>%
+  summarise(weight_pct = sum(weight), .groups = "drop") %>%
+  mutate(share_of_equities_pct = weight_pct / sum(weight_pct) * 100) %>%
+  arrange(desc(weight_pct))
+multiagent_sheets <- build_multiagent_sheets(
+  positions = export_positions, ticker_summary = ticker_summary, mrc_table = mrc_table,
+  sleeve_model = sleeve_model, asset_classes = asset_class_pct,
+  equity_concentration = equity_concentration, sectors = export_sectors,
+  countries = country_summary, currency_exposure = currency_exposure,
+  drawdown = compute_drawdown_table(closing_prices_clean, unique(export_positions$ticker),
+                                    from = sleeve_model$window[1]),
+  caveats = report_caveat_lines,
+  meta = list(scenario = scenario_active, data_as_of = data_as_of, rendered_at = Sys.time(),
+              equity_weight_pct = equity_weight_pct, lookthrough_coverage_pct = covered_weight_pct,
+              euler_coverage_pct = mrc_coverage_pct)
+)
+write_xlsx(multiagent_sheets, file.path(data_out, cfg$output_file))
+```
+
+```{r holding-positioning-plot, fig.height=8}
+if (!positioning_available) {
+  cat("_Not enough priced holdings with valid return/volatility data to build a holding-level positioning chart for this portfolio/scenario._")
+} else {
+  # Limit the chart to the same holdings shown in the two ranked tables
+  # below, rather than every priced holding, so the chart and tables agree.
+  holding_positioning_chart <- filter(holding_positioning, ticker %in% label_tickers)
+
+  p <- ggplot(holding_positioning_chart, aes(x = volatility_pct, y = annual_return)) +
+    geom_hline(yintercept = ref_return, linetype = "dashed", color = "#666666") +
+    geom_vline(xintercept = ref_vol, linetype = "dashed", color = "#666666") +
+    geom_point(aes(size = weight_pct, color = quadrant,
+      text = paste0(ticker, " — ", name,
+                    "<br>Sector: ", sector,
+                    "<br>Annual Return: ", round(annual_return, 1), "%",
+                    "<br>Volatility: ", round(volatility_pct, 1), "%",
+                    "<br>Weight: ", round(weight_pct, 2), "%")),
+      alpha = 0.75) +
+    geom_text(aes(label = ticker), size = 2.8, vjust = -1.1, check_overlap = TRUE) +
+    scale_color_manual(values = c(
+      "Improves risk/return"        = "#457B9D",
+      "Drags risk/return"           = "#E63946",
+      "Higher risk, higher return"  = "#F4A261",
+      "Lower risk, lower return"    = "#8D99AE",
+      "At portfolio position"       = "#2A9D8F"
+    ), name = "Positioning vs. Portfolio") +
+    scale_size_continuous(range = c(2, 14), name = "Portfolio Weight (%)") +
+    labs(
+      # ggplotly() drops labs(subtitle=...) entirely, so anything that must
+      # survive the HTML/interactive render has to live in the title itself.
+      title = paste0("Holding-Level Risk/Return Positioning vs. Portfolio (Top ",
+                      n_table, " Best & Worst by Weighted Impact)"),
+      subtitle = paste0("Dashed lines mark ", cfg$display_name, "'s own annualized return (",
+                         round(ref_return, 1), "%) and volatility (", round(ref_vol, 1), "%)"),
+      x = "Annualized Volatility (%)", y = "Annualized Return (%)"
+    ) +
+    theme_minimal() +
+    theme_report() +
+    theme(legend.position = "bottom")
+
+  if (knitr::is_html_output()) {
+    plotly::ggplotly(p, tooltip = "text")
+  } else {
+    p
+  }
+}
+```
+
+```{r holding-positioning-table-worst}
+if (n_table == 0) {
+  cat("_Too few priced holdings for a meaningful comparison._")
+} else {
+  worst_holdings %>%
+    transmute(
+      Ticker = ticker, `Company Name` = name, Sector = sector,
+      `Weight (%)` = weight_pct, `Annual Return (%)` = annual_return,
+      `Volatility (%)` = volatility_pct, Positioning = as.character(quadrant)
+    ) %>%
+    knitr::kable(digits = 2, caption = paste0("Top ", n_table,
+      " Holdings Dragging Down ", cfg$display_name, " (by weighted impact)")) %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::column_spec(2, width = "14em")
+}
+```
+
+```{r holding-positioning-table-best}
+if (n_table == 0) {
+  cat("_Too few priced holdings for a meaningful comparison._")
+} else {
+  best_holdings %>%
+    transmute(
+      Ticker = ticker, `Company Name` = name, Sector = sector,
+      `Weight (%)` = weight_pct, `Annual Return (%)` = annual_return,
+      `Volatility (%)` = volatility_pct, Positioning = as.character(quadrant)
+    ) %>%
+    knitr::kable(digits = 2, caption = paste0("Top ", n_table,
+      " Holdings Improving ", cfg$display_name, " (by weighted impact)")) %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::column_spec(2, width = "14em")
+}
+```
+
+```{r holding-positioning-table-pure-improvers}
+if (n_pure_improvers == 0) {
+  cat("_No holdings currently combine below-portfolio volatility with above-portfolio return._")
+} else {
+  pure_improvers %>%
+    transmute(
+      Ticker = ticker, `Company Name` = name, Sector = sector,
+      `Weight (%)` = weight_pct, `Annual Return (%)` = annual_return,
+      `Volatility (%)` = volatility_pct
+    ) %>%
+    knitr::kable(digits = 2, caption = paste0("Up to 10 Holdings Improving ", cfg$display_name,
+      " on Both Axes (Lower Volatility AND Higher Return, by weighted impact)")) %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::column_spec(2, width = "14em")
+}
+```
+
+```{r holding-positioning-insights, results='asis'}
+if (!positioning_available || n_table == 0) {
+  cat("_Insufficient data to characterize holding-level positioning for this portfolio/scenario._\n")
+} else {
+  cat("**Holding-Level Risk/Return Highlights:**\n\n")
+  cat("- **Most Dragging Holding**: ", worst_holdings$ticker[1], " (", worst_holdings$name[1],
+      "), ", round(worst_holdings$annual_return[1], 1), "% return / ",
+      round(worst_holdings$volatility_pct[1], 1), "% volatility at ",
+      round(worst_holdings$weight_pct[1], 2), "% weight\n", sep = "")
+  cat("- **Most Improving Holding**: ", best_holdings$ticker[1], " (", best_holdings$name[1],
+      "), ", round(best_holdings$annual_return[1], 1), "% return / ",
+      round(best_holdings$volatility_pct[1], 1), "% volatility at ",
+      round(best_holdings$weight_pct[1], 2), "% weight\n", sep = "")
+  cat("- **Holdings Strictly Better on Both Axes**: ", n_pure_improvers,
+      " holding(s) combine below-portfolio volatility with above-portfolio return at once\n\n", sep = "")
+
+  cat("**Interpretation:**\n\n")
+  cat("Dashed crosshairs mark the portfolio's own annualized return and volatility (Section 6.1). ",
+      "Holdings toward the lower-right combine below-portfolio return with above-portfolio volatility ",
+      "and drag the overall position toward a weaker risk/return trade-off; holdings toward the ",
+      "upper-left combine above-portfolio return with below-portfolio volatility and pull the ",
+      "position toward a stronger one. Weighting each holding's positioning score by its portfolio ",
+      "weight (above) separates holdings that merely look bad/good on paper from those that actually ",
+      "move the needle at current allocation sizes.\n", sep = "")
+}
+```
+
+### 6.4 Performance Attribution by Sector
+
+Decomposes the portfolio's blended return by sector — and, against MSCI World (URTH), its excess return — reusing the sector-level weight/return data already computed in Section 6.2. This is a return-contribution breakdown, not a full Brinson allocation/selection split: that split needs the benchmark's *own* sector composition (e.g. MSCI World's actual sector weights), which this pipeline doesn't fetch — `get_price_data.R`'s `BENCHMARK_TICKERS` covers benchmark price series only. See `compute_sector_attribution()` in `portfolio_returns.R` for the full explanation of what this is and isn't.
+
+```{r attribution-calc, include=FALSE}
+urth_return <- benchmark_points %>% filter(label == "URTH") %>% pull(return)
+has_urth_benchmark <- length(urth_return) == 1
+
+sector_attribution <- if (has_urth_benchmark) {
+  compute_sector_attribution(sector_bubble_summary, benchmark_return = urth_return)
+} else {
+  compute_sector_attribution(sector_bubble_summary)
+}
+
+top_contributor <- sector_attribution %>% slice_max(contribution_pct, n = 1)
+bottom_contributor <- sector_attribution %>% slice_min(contribution_pct, n = 1)
+```
+
+```{r attribution-table}
+attribution_cols  <- c("sector", "weight", "avg_return", "contribution_pct")
+attribution_names <- c("Sector", "Weight %", "Avg Return %", "Contribution (pp)")
+if (has_urth_benchmark) {
+  attribution_cols  <- c(attribution_cols, "excess_contribution_pct")
+  attribution_names <- c(attribution_names, "Excess vs URTH (pp)")
+}
+
+sector_attribution %>%
+  select(all_of(attribution_cols)) %>%
+  knitr::kable(col.names = attribution_names, digits = 2,
+               caption = "Sector Contribution to Portfolio Return") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r attribution-plot, fig.height=6}
+ggplot(sector_attribution, aes(x = reorder(sector, contribution_pct), y = contribution_pct,
+                                fill = contribution_pct >= 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c(`TRUE` = "#2E86AB", `FALSE` = "#E63946"), guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(
+    title = "Sector Contribution to Portfolio Return",
+    subtitle = paste0("Annualized basis, ", scales::comma(nrow(sector_attribution)), " sectors, ",
+                       round(portfolio_weight_coverage_pct, 1), "% of portfolio weight priced"),
+    x = NULL, y = "Contribution to Return (percentage points)"
+  ) +
+  theme_minimal() +
+  theme_report()
+```
+
+```{r attribution-insights, results='asis'}
+cat("**Return Contribution Highlights:**\n\n")
+cat("- **Largest positive contributor**: ", top_contributor$sector[1], " (",
+    round(top_contributor$contribution_pct[1], 2), " pp)\n", sep = "")
+cat("- **Largest drag**: ", bottom_contributor$sector[1], " (",
+    round(bottom_contributor$contribution_pct[1], 2), " pp)\n", sep = "")
+
+if (has_urth_benchmark) {
+  total_excess <- sum(sector_attribution$excess_contribution_pct)
+  cat("- **Total excess return vs. URTH (MSCI World)**: ", round(total_excess, 2), " pp (",
+      if_else(total_excess >= 0, "outperformance", "underperformance"), ")\n\n", sep = "")
+} else {
+  cat("\n*No URTH benchmark price data cached — excess-return comparison skipped. Run get_price_data.R to fetch it.*\n\n")
+}
+
+cat("**Interpretation:**\n\n")
+cat("Contribution (pp) is each sector's weight-normalized share of the portfolio's own blended ",
+    "annualized return — it sums exactly to that blended return. This is a return-contribution ",
+    "breakdown, not a full Brinson allocation/selection split: separating \"we were overweight ",
+    "sector X\" from \"our sector-X holdings beat sector X's own benchmark\" would need the ",
+    "benchmark's own sector composition, which isn't data this pipeline fetches (see ",
+    "`compute_sector_attribution()` in `portfolio_returns.R`).\n", sep = "")
+```
+
+------------------------------------------------------------------------
+
+```{r data-quality-metrics, include=FALSE}
+# Calculate data quality metrics dynamically
+dq_total_holdings <- nrow(portfolio)
+dq_total_funds <- length(unique(portfolio$index))
+dq_total_countries <- n_distinct(portfolio$alpha3[!is.na(portfolio$alpha3) & portfolio$alpha3 != "-"])
+
+# Fund coverage
+dq_holdings_with_fund <- sum(!is.na(portfolio$index) & portfolio$index != "")
+dq_fund_coverage <- (dq_holdings_with_fund / dq_total_holdings) * 100
+
+# Geographic classification
+dq_holdings_with_country <- sum(!is.na(portfolio$alpha3) & portfolio$alpha3 != "-")
+dq_geographic_coverage <- (dq_holdings_with_country / dq_total_holdings) * 100
+dq_holdings_without_country <- dq_total_holdings - dq_holdings_with_country
+
+# Security identification (ticker)
+dq_holdings_with_ticker <- sum(!is.na(portfolio$ticker) & portfolio$ticker != "")
+dq_ticker_coverage <- (dq_holdings_with_ticker / dq_total_holdings) * 100
+dq_holdings_without_ticker <- dq_total_holdings - dq_holdings_with_ticker
+
+# Total weight
+dq_total_weight <- sum(portfolio$weight, na.rm = TRUE)
+
+# Duplicate ISINs
+# NA ISINs (Cash/Low Risk Bonds pseudo-holdings, and constituents without an
+# ISIN) must be excluded before count(): it buckets all NAs into one group,
+# which would otherwise register as a single fake "ISIN repeated N times".
+dq_duplicate_isins <- portfolio %>%
+  filter(!is.na(ISIN)) %>%
+  count(ISIN) %>%
+  filter(n > 1) %>%
+  nrow()
+
+# Sector coverage: reuse sector_coverage_pct (risk-metrics-calculation chunk,
+# above), which joins on ticker via ticker_sector_lookup - the same
+# classification used everywhere else in the report (sunburst,
+# bubble chart, tornado chart). Previously this recomputed its own figure via
+# a separate ISIN-keyed join against tickerliste, which could disagree with
+# sector_coverage_pct for any holding whose ticker is classified but ISIN is
+# NA (or vice versa) - two different "sector coverage" numbers shown as if
+# they were the same thing.
+dq_sector_coverage <- sector_coverage_pct
+
+# Holdings with weight < 0.01%
+dq_low_weight_holdings <- sum(portfolio$weight < 0.01, na.rm = TRUE)
+dq_low_weight_pct <- (dq_low_weight_holdings / dq_total_holdings) * 100
+
+# Min/max coverage percentages for rounding in text
+dq_min_coverage <- min(dq_fund_coverage, dq_geographic_coverage, dq_ticker_coverage)
+dq_max_coverage <- max(dq_fund_coverage, dq_geographic_coverage, dq_ticker_coverage)
+
+# EUR price conversion: cached price rows load_cached_prices_eur() had to drop
+# (no currency in the currency map, or dated before the first / after the last
+# usable FX rate). They are excluded from every risk and return figure, so
+# the report says how many and which tickers, weighted by how much of the
+# portfolio they carry (0 = not held, e.g. a renamed ticker's stale series).
+dq_price_rows_dropped <- nrow(price_conversion_dropped)
+dq_price_rows_total   <- nrow(closing_prices_clean) + dq_price_rows_dropped
+dq_first_fx_date      <- suppressWarnings(min(load_fx_rates()$Date))
+
+dq_ticker_weight <- ticker_summary %>%
+  group_by(ticker) %>%
+  summarise(weight_pct = sum(weight_pct), .groups = "drop")
+
+dq_price_dropped_by_ticker <- price_conversion_dropped %>%
+  mutate(reason = if_else(is.na(currency), "no currency", "no FX rate")) %>%
+  count(ticker, reason, name = "rows") %>%
+  left_join(dq_ticker_weight, by = "ticker") %>%
+  mutate(weight_pct = replace_na(weight_pct, 0)) %>%
+  arrange(desc(weight_pct), desc(rows))
+
+# Implausible single-day moves in the cached prices (possible instruments
+# spliced under one ticker); see find_price_jumps() in price_cache.R.
+dq_price_jumps <- find_price_jumps(closing_prices_clean) %>%
+  left_join(dq_ticker_weight, by = "ticker") %>%
+  mutate(weight_pct = replace_na(weight_pct, 0))
+dq_proxied <- fund_data %>% filter(!is.na(proxy_file))
+dq_proxy_note <- if (nrow(dq_proxied) == 0) {
+  "none — every fund uses its published holdings."
+} else {
+  paste0(paste0(dq_proxied$label, " is modelled with the holdings of ", sub("\\.xlsx$", "", dq_proxied$proxy_file),
+                " (config/fund_proxies.csv) instead of its published holdings, which are not its economic exposure (e.g. a swap ETF's collateral basket)",
+                collapse = "; "), ". Section 7.2 shows how well that approximation tracks the fund.")
+}
+dq_price_jump_note <- if (nrow(dq_price_jumps) == 0) {
+  "no single-day price move beyond -33% / +49% in any cached series."
+} else {
+  paste0(nrow(dq_price_jumps), " single-day move(s) beyond -33% / +49% - possible mixed instruments, ",
+         "check before trusting these series: ",
+         paste0(head(dq_price_jumps$ticker, 6), " on ", head(dq_price_jumps$Date, 6),
+                " (", round((exp(head(dq_price_jumps$log_return, 6)) - 1) * 100), "%)", collapse = "; "), ".")
+}
+
+dq_price_conversion_note <- if (dq_price_rows_dropped == 0) {
+  "all cached price rows were converted to EUR."
+} else {
+  described <- dq_price_dropped_by_ticker %>%
+    slice_head(n = 6) %>%
+    mutate(text = paste0(ticker, " (", reason, ", ", rows, " rows, ",
+                         round(weight_pct, 2), "% of portfolio weight)"))
+  paste0(
+    scales::comma(dq_price_rows_dropped), " of ", scales::comma(dq_price_rows_total),
+    " cached price rows (", round(dq_price_rows_dropped / dq_price_rows_total * 100, 1),
+    "%) could not be converted to EUR and are excluded from all risk and return figures: ",
+    paste(described$text, collapse = "; "),
+    if (nrow(dq_price_dropped_by_ticker) > 6) paste0("; and ", nrow(dq_price_dropped_by_ticker) - 6, " more") else "",
+    ". Rows dated before the first cached FX rate (", format(dq_first_fx_date), ") can't be converted."
+  )
+}
+```
+
+## 7. Data Quality and Completeness
+
+The portfolio dataset demonstrates **robust data quality across primary identifier fields**, with `r round(dq_min_coverage, 1)`–`r round(dq_max_coverage, 1)`% completeness for critical attributes including fund source allocation, security identifiers (ISIN, ticker), geographic classification, and portfolio weights. Across `r scales::comma(dq_total_holdings)` total holdings spanning `r dq_total_funds` fund sources and `r dq_total_countries` countries, the data exhibits strong structural integrity suitable for detailed portfolio analysis.
+
+**Key Quality Metrics:**
+
+- **Fund Source Coverage**: `r round(dq_fund_coverage, 1)`% — All holdings successfully attributed to source funds
+- **Geographic Classification**: `r round(dq_geographic_coverage, 1)`% — `r scales::comma(dq_holdings_with_country)` of `r scales::comma(dq_total_holdings)` holdings mapped to countries; `r dq_holdings_without_country` holdings lack country codes
+- **Security Identification**: `r round(dq_ticker_coverage, 1)`% — Ticker symbols present for `r scales::comma(dq_holdings_with_ticker)` holdings; `r dq_holdings_without_ticker` missing
+- **Portfolio Weight Integrity**: All weights positive and properly allocated across funds; fund allocations sum to `r round(dq_total_weight, 2)` units (reflects position-level weighting from underlying constituent data)
+- **Duplicate Handling**: `r dq_duplicate_isins` ISINs appear multiple times across fund holdings—expected due to multi-fund exposure (e.g., major indices held across multiple ETFs)
+
+**Data Limitations:**
+
+- **Sector Classification**: `r round(dq_sector_coverage, 1)`% coverage (by equity weight), concentrated in US-listed equities. European and international securities remain unclassified due to data availability constraints from Finnhub API
+- **Price Conversion (EUR)**: `r dq_price_conversion_note`
+- **Price Jumps**: `r dq_price_jump_note`
+- **Sleeve Model**: Cash and Low Risk Bonds have no price history; the whole-portfolio figures in Section 2.1 use assumed returns and volatilities for them (`r paste0(sleeve_assumptions$ticker, ": ", sleeve_assumptions$annual_return_pct, "% return, ", sleeve_assumptions$volatility_pct, "% volatility", collapse = "; ")`, uncorrelated with everything else; `config/sleeve_assumptions.csv`).
+- **Proxy Holdings**: `r dq_proxy_note`
+- **Minor Gaps**:`r dq_holdings_without_country + dq_holdings_without_ticker` holdings (`r round((dq_holdings_without_country + dq_holdings_without_ticker) / dq_total_holdings * 100, 1)`%) lack ticker/country information; `r dq_low_weight_holdings` holdings (`r round(dq_low_weight_pct, 1)`%) have near-zero weights below 0.01%, likely representing rounding or fund rebalancing artefacts
+
+**Assessment**: Portfolio data is **production-quality** for geographic, fund allocation, and concentration analyses. Sector-level analysis is limited due to sparse coverage; international holdings should be analyzed by country/fund source rather than sector.
+
+### 7.1 Methodology
+
+This analysis aggregates holdings from multiple ETF positions, weighting each constituent according to the proportion of the portfolio allocated to that fund. Country assignments are based on the primary listing location of each security. Fund identification includes the source index or ETF from which each position originates. Volatility and returns are annualized by each series' own quote frequency (observations per calendar year: about 365 for cryptocurrencies, which are quoted every day, about 250 for stocks, and `r round(window_k)` for the shared return panel, which only keeps dates on which every holding traded), so series with different numbers of quotes stay comparable. Sector data is sourced from Finnhub and currently covers US-listed equities only.
+
+### 7.2 Fund Look-Through vs. the Fund's Own Price Series
+
+```{r fund-tracking, echo=FALSE, message=FALSE, warning=FALSE}
+fund_tracking <- compute_fund_tracking_table(fund_data, load_etf_listings(), closing_prices_clean)
+fund_tracking <- fund_tracking %>%
+  left_join(fund_data %>% select(fund_file = file, proxy_file), by = "fund_file")
+```
+
+```{r fund-tracking-table, echo=FALSE, results='asis'}
+if (nrow(fund_tracking) == 0) {
+  cat("_No fund in this portfolio has a price series configured in `config/etf_listings.csv`._\n")
+} else {
+  fund_tracking %>%
+    transmute(
+      Fund = if_else(is.na(proxy_file), label, paste0(label, " (proxy: ", sub("\\.xlsx$", "", proxy_file), ")")),
+      `Holdings covered` = paste0(n_covered, " / ", n_holdings),
+      `Weight covered %` = round(coverage_pct, 1),
+      `Shared days` = n_obs,
+      Correlation = round(correlation, 2),
+      Beta = round(beta, 2),
+      `R²` = round(r_squared, 2),
+      `Tracking error % p.a.` = round(tracking_error_pct, 1),
+      `Return fund %` = round(cum_fund_pct, 1),
+      `Return rebuilt %` = round(cum_rebuilt_pct, 1),
+      Note = note
+    ) %>%
+    knitr::kable(caption = "Look-through series rebuilt from the fund's holdings vs. the fund's own EUR price series") %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    print()
+}
+```
+
+Each fund's holdings (today's weights, renormalized over the holdings that have a current price history) are rebuilt into a daily return series and compared with the fund's own price series over the same days. It is a **consistency check, not a measurement of the fund's true tracking error**: a low `Weight covered` means only the largest holdings are rebuilt, which alone lowers correlation and raises the difference; US stocks close after the European fund listing, which lowers same-day correlation further. A fund that covers most of its weight but still shows a low correlation and a very different return deserves a look at the holdings file itself — typical causes are a wrong ISIN/listing in `config/etf_listings.csv`, wrong ticker mappings, or a **synthetic (swap-based) ETF, whose published holdings are its collateral basket and not the index it delivers**.
+
+------------------------------------------------------------------------
+
+## 8. Important Information
+
+This report was generated programmatically from `r cfg$display_name`'s holdings data on `r format(Sys.Date(), "%B %d, %Y")` with prices up to `r format(data_as_of, "%B %d, %Y")` and is intended for personal portfolio monitoring only. It does not constitute investment advice, a recommendation, or an offer to buy or sell any security. Volatility figures are annualized and derived from historical daily prices; the inputs of Section 2.3 fall back to sector-estimated or fixed assumptions where no price history exists (`r sum(portfolio_risk$vol_source == "Historical")` of its `r nrow(portfolio_risk)` holdings use historical volatility). Past performance and historical correlation are not indicative of future results. All figures in this report are calculated directly from the underlying holdings and price data at render time and will change as that data is refreshed.
+

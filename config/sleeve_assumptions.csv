@@ -1,0 +1,3 @@
+ticker,annual_return_pct,volatility_pct,note
+CASH_EUR,2,0,"Cash: assumed to earn 2% p.a. with no volatility (replace with your account rate)"
+BONDS_LR_EUR,3,3,"Low Risk Bonds: assumed 3% p.a. return and 3% volatility, uncorrelated with everything else (no price history exists for the pseudo-holding; replace with the real fund's figures)"

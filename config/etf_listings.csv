@@ -1,0 +1,12 @@
+fund_file,isin,ticker,currency,price_scale,note
+AmundiCoreWorld.xlsx,LU2572257124,AHYQ.XETRA,EUR,1,Amundi MSCI World III UCITS ETF; XETRA is its only EODHD listing
+XtrackersWorldExUSA.xlsx,IE0006WW1TQ4,EXUS.XETRA,EUR,1,Xtrackers MSCI World ex USA UCITS ETF 1C
+iSharesEMIMI.xlsx,IE00BKM4GZ66,IS3N.XETRA,EUR,1,iShares Core MSCI EM IMI UCITS ETF (Acc)
+VanguardFTSE.xlsx,IE00BK5BQT80,VWCE.XETRA,EUR,1,Vanguard FTSE All-World UCITS ETF USD Acc
+AmundiCoreStoxxEurope600.xlsx,LU0908500753,LYP6.XETRA,EUR,1,Amundi Core STOXX Europe 600 UCITS ETF Acc (physical; holdings file is the fund's own export)
+iSharesACWI.xlsx,IE00B6R52259,IUSQ.XETRA,EUR,1,iShares MSCI ACWI UCITS ETF USD Acc
+DekaEuroStoxx50.xlsx,DE000ETFL029,EL4B.XETRA,EUR,1,Deka EURO STOXX 50 UCITS ETF (distributing; Adjusted_close includes payouts)
+DekaWorldClimateChange.xlsx,DE000ETFL581,D6RP.XETRA,EUR,1,Deka MSCI World Climate Change ESG UCITS ETF (distributing)
+AmundiDisruptiveTech.xlsx,LU2023678282,DRUP.XETRA,EUR,1,Amundi MSCI Disruptive Technology ESG Screened ETF Acc
+OekoWorldTop10.xlsx,LU0301152442,LU0301152442.EUFUND,EUR,1,NOT exchange-traded: NAV series of the fund OekoWorld Klima C (ISIN as configured)
+CTLuxEuroSmComp.xlsx,LU1864952335,LU1864952335.EUFUND,EUR,1,NOT exchange-traded: NAV series of Threadneedle (Lux) European Smaller Companies 1E
