@@ -269,7 +269,7 @@ portfolio/
 │   └── output/                     # Multi-agent export (gitignored)
 ├── outputs/                        # Generated charts (gitignored)
 ├── results/, reports/              # Rendered reports (gitignored)
-└── logs/                           # pipeline.log, price_fetch.log (gitignored)
+└── logs/                           # pipeline.log (gitignored)
 ```
 
 ------------------------------------------------------------------------
